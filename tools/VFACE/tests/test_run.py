@@ -214,6 +214,71 @@ def test_a_template_alone_gives_the_feature_table_and_no_verdict(tmp_path):
     assert report["features"] == len(PATIENTS)
 
 
+def test_a_model_the_table_cannot_feed_does_not_cost_the_measurements(tmp_path):
+    """The failure a real run hit at 0.97, after everything else had succeeded.
+
+    A bundle trained on features the run never measured is a real
+    misconfiguration -- and until this test it was a 422 that took the
+    registration, the landmark search and the measurement tables down with it.
+    The server destroys a job directory when the run fails, so the clinician was
+    left with the GPU minutes and nothing at all, for a verdict they could have
+    read off the table by hand.
+
+    So the refusal is recorded and the run finishes. What is asserted is the
+    whole of that: the measurements and the feature table are in the archive,
+    the report says plainly why there is no verdict, and there is no
+    Classification folder pretending otherwise.
+    """
+    from test_classify import FEATURES, train
+
+    bundle = tmp_path / "vface_models"
+    trained_on = ["CB_Nothing_Nothing_RL", "CB_Absent_Absent_IS"]
+    for name in ("sym_asymm.txt", "mand_asym.txt", "max_asym.txt"):
+        train(bundle / name, trained_on, lambda row: row[trained_on[0]] > 0)
+
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path,
+        feature_template=write_feature_template(tmp_path / "template.xlsx", FEATURES),
+        classifier_model=str(bundle),
+    ))
+
+    written = tree_of(tmp_path / "out")
+    assert os.path.join("Measurements", "Measurements_CB.xlsx") in written
+    assert os.path.join("Measurements", dispatch.FEATURE_TABLE_NAME) in written
+    assert not any(name.startswith("Classification") for name in written)
+
+    report = read_report(tmp_path / "out")
+    assert "CB_Nothing_Nothing_RL" in report["classification"]
+    assert "were written" in report["classification"]
+    assert "classified" not in report
+
+
+def test_a_template_naming_nothing_measured_does_not_cost_them_either(tmp_path):
+    """The same rule one step earlier, where the table itself cannot be built.
+
+    `build_feature_table` refuses when no patient has any measurement at all,
+    and that refusal used to end the run the same way. Here the template names
+    only columns from a region this run never measured, so every column is
+    empty -- which the report says, column by column.
+    """
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path,
+        regions=[catalogs.REGION_CRANIAL_BASE],
+        feature_template=write_feature_template(
+            tmp_path / "template.xlsx", ["MAX_ANS_ANS_RL", "MAX_RPF_LPF_IS"]
+        ),
+    ))
+
+    written = tree_of(tmp_path / "out")
+    assert os.path.join("Measurements", "Measurements_CB.xlsx") in written
+    report = read_report(tmp_path / "out")
+    assert report.get("features") == len(PATIENTS)
+    empty = report.get("features_empty", {})
+    assert empty, "a column no measurement can fill has to be reported"
+
+
 # ---------------------------------------------------------------------------
 # Refusing at the door
 # ---------------------------------------------------------------------------

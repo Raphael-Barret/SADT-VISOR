@@ -598,8 +598,18 @@ def _classify(stats, feature_template: str, classifier_model: str,
         )
         return
 
-    columns = features.read_template_columns(feature_template)
-    records = features.build_feature_table(stats, columns, report=report)
+    try:
+        columns = features.read_template_columns(feature_template)
+        records = features.build_feature_table(stats, columns, report=report)
+    except ToolInputError as exc:
+        # The measurements are already computed and written. Raising here would
+        # take a registration, a landmark search and a table of measurements
+        # down with the verdict on top of them -- and the server destroys the
+        # job directory on failure, so the clinician would be left with the GPU
+        # minutes and nothing else.
+        report["classification"] = f"not run: {exc}"
+        return
+
     features.write_table(
         records, ["ID"] + list(columns),
         os.path.join(output_dir, MEASUREMENTS_DIRNAME, FEATURE_TABLE_NAME),
@@ -613,7 +623,18 @@ def _classify(stats, feature_template: str, classifier_model: str,
         )
         return
 
-    classified = classify.classify(records, classifier_model, report=report)
+    try:
+        classified = classify.classify(records, classifier_model, report=report)
+    except ToolInputError as exc:
+        # Same reasoning, one step further along: the feature table is written
+        # too by now, and it is what somebody would look at to find out WHY the
+        # models could not read it.
+        report["classification"] = (
+            f"not run: {exc} The measurements and the feature table were written "
+            "and are in this archive."
+        )
+        return
+
     classify.write_table(classified, os.path.join(
         output_dir, CLASSIFICATION_DIRNAME, CLASSIFICATION_NAME
     ))
