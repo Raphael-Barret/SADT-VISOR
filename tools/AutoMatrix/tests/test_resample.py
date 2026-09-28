@@ -220,3 +220,161 @@ def test_the_input_image_is_not_modified(label_image):
 
     assert np.array_equal(sitk.GetArrayFromImage(image), before)
     assert image.GetOrigin() == (0.0, 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# A transform that turns or flips the image
+# ---------------------------------------------------------------------------
+# Moving the output origin by the transform while leaving the output DIRECTION
+# alone only describes the same box for a pure translation. For anything that
+# turns or flips, the box lands somewhere the content is not -- and for VFACE's
+# mirror it landed entirely past the far side of the head, so the resampled
+# volume came back with not one non-zero voxel. AREG_CBCT then registered that
+# empty volume, reported a success, and an asymmetry measurement between a
+# midline point and its own mirror came out at 164 mm instead of nothing.
+
+
+def _mirror():
+    """VFACE's own `Matrix_mirror.tfm`: `x -> -x` about x = 0."""
+    transform = sitk.AffineTransform(3)
+    transform.SetMatrix((-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    return transform
+
+
+def _quarter_turn():
+    """A rotation, to say the rule is about turning and not about flipping."""
+    transform = sitk.Euler3DTransform()
+    transform.SetRotation(0.0, 0.0, np.pi / 2)
+    return transform
+
+
+def _centred_cube():
+    """A cube in a box centred on the origin, like an oriented CBCT.
+
+    Centred on purpose: that is the geometry VFACE's mirror is applied in, and
+    the one where transforming the origin sends the box exactly one field of
+    view away.
+    """
+    array = np.zeros((8, 8, 8), np.int16)
+    array[2:5, 2:5, 2:5] = 7
+    image = sitk.GetImageFromArray(array)
+    image.SetSpacing((1.0, 1.0, 1.0))
+    image.SetOrigin((-4.0, -4.0, -4.0))
+    return image
+
+
+def test_a_mirrored_volume_is_not_empty():
+    """The defect itself, in one assertion.
+
+    Not "the origin is right" but "there is something in the image": a test on
+    the geometry alone would have passed against a box full of nothing, which is
+    what a whole VFACE run was built on.
+    """
+    image = _centred_cube()
+
+    mirrored = pipeline.resample(image, _mirror())
+
+    assert sitk.GetArrayFromImage(mirrored).any(), "the mirror emptied the volume"
+
+
+def test_a_mirrored_volume_occupies_the_box_it_came_from():
+    """Same grid in, same grid out -- which is what the shipped reference has.
+
+    `V_FACE/Test_Output/T2_Scan/CB/C_0001_T1_CB_Or_mir.nii.gz` spans the same x
+    as the scan it was mirrored from, and holds 20 910 456 non-zero voxels
+    against the original's 20 962 743. Keeping the grid reproduces that; moving
+    the origin produced zero.
+    """
+    image = _centred_cube()
+
+    mirrored = pipeline.resample(image, _mirror())
+
+    assert mirrored.GetOrigin() == image.GetOrigin()
+    assert mirrored.GetSize() == image.GetSize()
+    assert mirrored.GetSpacing() == image.GetSpacing()
+
+
+def _centroid_x(image):
+    """Where the content sits on the x axis, in millimetres, not in voxels."""
+    array = sitk.GetArrayFromImage(image)          # indexed (z, y, x)
+    weights = array.astype(float)
+    indices = np.arange(array.shape[2])
+    centre = float((weights.sum(axis=(0, 1)) * indices).sum() / weights.sum())
+    return image.GetOrigin()[0] + centre * image.GetSpacing()[0]
+
+
+def test_a_mirrored_volume_is_actually_mirrored():
+    """And it is the anatomy that moved, not the box.
+
+    Asserted on the content's position in MILLIMETRES rather than on a reversed
+    array, because the two are not the same statement: an 8-voxel grid spanning
+    [-4, 4] has its voxel centres at -4 .. 3, so its own middle is at -0.5 and a
+    geometric flip about x = 0 is not `array[..., ::-1]`. The physical claim is
+    the one that matters -- and an implementation that returned the input
+    untouched would pass the two tests above and fail this one.
+    """
+    image = _centred_cube()
+    before = _centroid_x(image)
+
+    after = _centroid_x(pipeline.resample(image, _mirror()))
+
+    assert before == pytest.approx(-after, abs=1e-6)
+    assert abs(before) > 0.5, "a cube on the midline could not have shown that"
+
+
+def test_a_rotation_keeps_its_box_too():
+    image = _centred_cube()
+
+    turned = pipeline.resample(image, _quarter_turn())
+
+    assert turned.GetOrigin() == image.GetOrigin()
+    assert sitk.GetArrayFromImage(turned).any()
+
+
+def test_a_translation_still_carries_the_origin_with_it(label_image):
+    """The behaviour this narrows, asserted beside it so the contrast is read.
+
+    A pure translation is the one case where moving the origin is
+    self-consistent, it is what the port was written for, and it does not move.
+    """
+    image = label_image(origin=(10.0, 20.0, 30.0))
+
+    resampled = pipeline.resample(image, sitk.TranslationTransform(3, (1.0, 2.0, 3.0)))
+
+    assert resampled.GetOrigin() == (11.0, 22.0, 33.0)
+
+
+# ---------------------------------------------------------------------------
+# The question the rule asks
+# ---------------------------------------------------------------------------
+
+def test_a_translation_is_recognised_whatever_class_it_arrives_as():
+    """Probed, not read off a matrix: a transform reaches this tool as any of
+    half a dozen ITK classes and only some answer `GetMatrix`."""
+    assert pipeline.is_pure_translation(sitk.TranslationTransform(3, (1.0, 2.0, 3.0)))
+
+    affine = sitk.AffineTransform(3)
+    affine.SetTranslation((1.0, 2.0, 3.0))
+    assert pipeline.is_pure_translation(affine)
+
+    composite = sitk.CompositeTransform(3)
+    composite.AddTransform(sitk.TranslationTransform(3, (1.0, 0.0, 0.0)))
+    composite.AddTransform(sitk.TranslationTransform(3, (0.0, 2.0, 0.0)))
+    assert pipeline.is_pure_translation(composite)
+
+    assert pipeline.is_pure_translation(sitk.Euler3DTransform())  # no rotation set
+
+
+def test_anything_that_turns_or_flips_is_not_one():
+    assert not pipeline.is_pure_translation(_mirror())
+    assert not pipeline.is_pure_translation(_quarter_turn())
+
+    scaled = sitk.AffineTransform(3)
+    scaled.Scale(2.0)
+    assert not pipeline.is_pure_translation(scaled)
+
+    # A rotation with a translation on top is still not a pure translation.
+    composite = sitk.CompositeTransform(3)
+    composite.AddTransform(sitk.TranslationTransform(3, (5.0, 0.0, 0.0)))
+    composite.AddTransform(_mirror())
+    assert not pipeline.is_pure_translation(composite)

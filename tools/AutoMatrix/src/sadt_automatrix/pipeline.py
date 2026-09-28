@@ -104,6 +104,25 @@ def apply_to_landmarks(source: str, transform, destination: str) -> int:
     return moved
 
 
+def is_pure_translation(transform, tolerance: float = 1e-6) -> bool:
+    """True when `transform` only shifts, with no rotation, scale or reflection.
+
+    Probed rather than read off a matrix, because a transform arrives as any of
+    half a dozen ITK classes -- Translation, Euler, Affine, a Composite of
+    several, a bare 4x4 GreedyReg wrote -- and only some of them answer
+    `GetMatrix`. What is asked here is the only property the caller cares about:
+    does this transform move the three basis directions?
+    """
+    import numpy as np
+
+    at_origin = np.asarray(transform.TransformPoint((0.0, 0.0, 0.0)))
+    for axis in np.eye(3):
+        moved = np.asarray(transform.TransformPoint(tuple(axis))) - at_origin
+        if not np.allclose(moved, axis, atol=tolerance):
+            return False
+    return True
+
+
 def resample(image, transform, reference=None, is_segmentation: bool = False):
     """The resampled image.
 
@@ -111,9 +130,27 @@ def resample(image, transform, reference=None, is_segmentation: bool = False):
     and the one that matters: interpolating a label map linearly produces
     labels that were never in it.
 
-    With no reference, the output keeps the input's grid and only its origin
-    moves. That mimics what `ResampleScalarVectorDWIVolume` did without one,
-    which is the behaviour the Slicer module was written against.
+    With no reference the output keeps the input's grid. Its origin also moves
+    by the transform, but ONLY when the transform is a pure translation -- which
+    is the case the behaviour was ported for, and the only one it is
+    self-consistent in.
+
+    **Moving the origin of a grid whose direction is left alone throws the
+    output box away from the content whenever the transform turns or flips it.**
+    VFACE's mirror is `x -> -x` about x = 0; on a scan spanning x in
+    [-84.15, 84.15] the transformed origin is +84.15, so the output grid ran
+    from +84.15 to +252.45 -- past the far side of the head -- and the resampled
+    volume came out with **not one non-zero voxel**. AREG_CBCT then registered
+    that empty volume onto the original, found the 168.30 mm translation that
+    brings an empty box back over a head, and reported a success; the mirrored
+    landmarks inherited that translation, and an asymmetry measurement between
+    a midline point and its own mirror came out at 164 mm instead of nothing.
+
+    The shipped reference output settles what the right answer is:
+    `V_FACE/Test_Output/T2_Scan/CB/C_0001_T1_CB_Or_mir.nii.gz` spans the same
+    x as the scan it was mirrored from and holds 20 910 456 non-zero voxels,
+    which is exactly what keeping the grid produces here. So the origin move was
+    never the Slicer module's behaviour for anything but a translation.
     """
     import SimpleITK as sitk
 
@@ -130,7 +167,11 @@ def resample(image, transform, reference=None, is_segmentation: bool = False):
         resampler.SetSize(image.GetSize())
         resampler.SetOutputSpacing(image.GetSpacing())
         resampler.SetOutputDirection(image.GetDirection())
-        resampler.SetOutputOrigin(transform.TransformPoint(image.GetOrigin()))
+        resampler.SetOutputOrigin(
+            transform.TransformPoint(image.GetOrigin())
+            if is_pure_translation(transform)
+            else image.GetOrigin()
+        )
 
     return resampler.Execute(image)
 
