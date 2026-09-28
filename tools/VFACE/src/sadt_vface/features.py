@@ -269,6 +269,18 @@ def build_feature_table(by_region: dict, template_columns, report: dict = None) 
             region = description["region"]
             by_landmark = indexed.get(region, {}).get(patient)
             if by_landmark is None:
+                # A column whose whole REGION was never measured, because the
+                # run was not asked to register it. Reported like any other
+                # empty column, and the region named once beside it: "the
+                # template asks for the maxilla and this run did not measure
+                # it" is the sentence that tells a reader what to change, and
+                # the silence here is what made a classification that could
+                # feed no model hard to read.
+                _note_empty(report, patient, column)
+                if report is not None and region:
+                    absent = report.setdefault("features_regions_absent", [])
+                    if region not in absent:
+                        absent.append(region)
                 continue
 
             values = []
@@ -281,14 +293,19 @@ def build_feature_table(by_region: dict, template_columns, report: dict = None) 
                     break
                 values.append(value)
             if not values:
-                if report is not None and values is None:
-                    report.setdefault("features_empty", {}).setdefault(
-                        patient, []
-                    ).append(column)
+                if values is None:
+                    _note_empty(report, patient, column)
                 continue
             record[column] = sum(values) / len(values)
         records.append(record)
     return records
+
+
+def _note_empty(report, patient: str, column: str) -> None:
+    """Say that one feature column came out empty for one patient."""
+    if report is None:
+        return
+    report.setdefault("features_empty", {}).setdefault(patient, []).append(column)
 
 
 def _value_of(by_landmark: dict, described: dict, pair: int):
