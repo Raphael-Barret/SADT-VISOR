@@ -45,6 +45,17 @@ _SEPARATORS = re.compile(r"([_\-.\s]+)")
 # this is what asks "is the character on this side of a match a separator".
 _SEPARATOR = re.compile(r"[_\-.\s]")
 
+# Every region's own tokens, in one set. `discover_masks` drops them from a
+# mask's key so that `P1_MAND_seg.nii.gz` keys to the `P1` its scan keys to
+# rather than to `P1_MAND`.
+ANATOMY_TOKENS = frozenset(
+    token for group in catalogs.REGION_TOKENS.values() for token in group
+)
+
+# What a token says when it sits just before it: "the scan before me was
+# oriented". `_SegOr` is one token once the separators are split off.
+_ORIENTATION_TOKENS = ("or", "segor")
+
 
 def split_scan_extension(filename: str) -> tuple:
     """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
@@ -170,6 +181,38 @@ def _token_aligned_index(stem: str, suffix: str) -> int:
             return start
         start = stem.find(suffix, start + 1)
     return -1
+
+
+def frame_tokens(stem: str) -> frozenset:
+    """The anatomy tokens this name carries as an ORIENTATION FRAME.
+
+    ASO does not append a bare `_Or`: it appends the frame it oriented into,
+    because the caller names the suffix. VFACE asks it for `CB_Or` and `MAX_Or`,
+    so `C_0002_T1_CB_Or.nii.gz` reads "C_0002, seen in the cranial base frame"
+    -- and `patient_stem`, which truncates at `_Or`, keeps that `CB` in the
+    subject's identity.
+
+    The mask AMASSS then makes from that very scan is
+    `C_0002_T1_CB_Or_seg_CBMASK.nii.gz`, and `discover_masks` drops every
+    anatomy token from it -- including the frame, which is not a structure. So a
+    scan keyed `C_0002_CB` and its own mask keyed `C_0002`, the leaf fallback in
+    `AREG_CBCT.pipeline.find_masks` compared the two and found nothing, and a
+    VFACE run failed with "no Cranial base mask for this subject" after paying
+    for the orientation, the segmentation and the registration.
+
+    A token in this position is therefore protected from that drop. Only in this
+    position: `P1_MAND_seg.nii.gz` names a structure, not a frame, and still
+    keys to `P1`.
+    """
+    words = [
+        part for part in split_parts(stem)
+        if part and not _SEPARATORS.fullmatch(part)
+    ]
+    return frozenset(
+        before.lower()
+        for before, after in zip(words, words[1:])
+        if after.lower() in _ORIENTATION_TOKENS and before.lower() in ANATOMY_TOKENS
+    )
 
 
 def patient_stem(filename: str, also_drop=(), drop_timepoint: bool = True) -> str:
@@ -383,10 +426,7 @@ def discover_masks(root: str, region: str) -> dict:
     """
     found: dict = {}
     wanted = catalogs.REGION_TOKENS[region]
-    # Every region's tokens, so the patient key of `P1_MAND_seg.nii.gz` is the
-    # `P1` its scan keys to rather than `P1_MAND`.
-    anatomy = {token for group in catalogs.REGION_TOKENS.values() for token in group}
-    anatomy |= set(catalogs.MASK_TOKENS)
+    anatomy = ANATOMY_TOKENS | set(catalogs.MASK_TOKENS)
 
     for directory, _, file_names in os.walk(root):
         relative = os.path.relpath(directory, root)
@@ -399,6 +439,10 @@ def discover_masks(root: str, region: str) -> dict:
                 continue
             if not has_token(stem, wanted):
                 continue
-            key = os.path.join(prefix, patient_stem(file_name, also_drop=anatomy))
+            # Minus the frame this scan was oriented into, which its own
+            # `patient_stem` keeps: see `frame_tokens`.
+            key = os.path.join(prefix, patient_stem(
+                file_name, also_drop=anatomy - frame_tokens(stem)
+            ))
             found.setdefault(key, os.path.join(directory, file_name))
     return found
