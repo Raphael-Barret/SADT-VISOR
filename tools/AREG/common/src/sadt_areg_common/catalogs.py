@@ -160,6 +160,13 @@ PATIENT_SUFFIXES = (
     "_scan", "_Scan", "_Seg", "_seg", "_Or", "_OR", "_lm",
 )
 
+# Which of those say "this scan was ORIENTED", and so may carry the frame it
+# was oriented into just before them. ASO appends no bare marker: its caller
+# names the suffix, and VFACE names it `CB_Or` and `MAX_Or`, so the frame ends
+# up inside the name -- `C_0002_T1_CB_Or.nii.gz`. See
+# `pairing._frame_aligned_index` for why a subject's key must not keep it.
+ORIENTATION_SUFFIXES = ("_SegOr", "_Or", "_OR")
+
 
 # ---------------------------------------------------------------------------
 # Jaws (IOS)

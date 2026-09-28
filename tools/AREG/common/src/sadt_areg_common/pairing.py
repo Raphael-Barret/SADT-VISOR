@@ -45,6 +45,14 @@ _SEPARATORS = re.compile(r"([_\-.\s]+)")
 # this is what asks "is the character on this side of a match a separator".
 _SEPARATOR = re.compile(r"[_\-.\s]")
 
+# Every region's own tokens, in one set. A mask's key drops them, so that
+# `P1_MAND_seg.nii.gz` keys to the `P1` its scan keys to rather than `P1_MAND`;
+# an oriented scan's key drops the one an orientation suffix follows, for the
+# reason `_frame_aligned_index` gives.
+ANATOMY_TOKENS = frozenset(
+    token for group in catalogs.REGION_TOKENS.values() for token in group
+)
+
 
 def split_scan_extension(filename: str) -> tuple:
     """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
@@ -172,6 +180,47 @@ def _token_aligned_index(stem: str, suffix: str) -> int:
     return -1
 
 
+def _frame_aligned_index(stem: str, index: int) -> int:
+    """`index` moved left over the ORIENTATION FRAME the suffix was added to.
+
+    ASO appends no bare `_Or`: its caller names the suffix, and names the frame
+    in it. VFACE asks for `CB_Or` and `MAX_Or`, so a cohort comes back as
+    `C_0002_T1_CB_Or.nii.gz` -- "C_0002, seen in the cranial base frame".
+
+    A frame is a point of view on a subject, not the subject, and every other
+    identity rule in this family already reads it that way:
+    `AutoMatrix.PATIENT_TOKENS_TO_DROP` drops `cb`/`mand`/`max` from a patient
+    key, `sadt_vface.landmarks.DECORATION_TOKENS` stops the identifier at the
+    first of them, and `discover_masks` drops them from a mask's name. Only
+    this function's caller kept it, and that made a scan and the mask AMASSS
+    produced FROM THAT SAME SCAN two different subjects -- `C_0002_CB` against
+    `C_0002`. A VFACE run then failed with "no Cranial base mask for this
+    subject" after paying for an orientation, a segmentation and three
+    registrations.
+
+    Narrow on purpose: the ONE token immediately before the suffix, only when it
+    is a region word, and only for a suffix that says an orientation happened.
+    `C_0001_T1_Or.nii.gz` -- AREG's own oriented mode, which names no frame --
+    is untouched, and so is a subject whose identifier merely holds a region
+    word somewhere else.
+    """
+    head = stem[:index]
+    parts = split_parts(head)
+    offset = len(head)
+    for part in reversed(parts):
+        offset -= len(part)
+        if not part or _SEPARATORS.fullmatch(part):
+            continue
+        if part.lower() not in ANATOMY_TOKENS:
+            return index
+        while offset > 0 and _SEPARATOR.match(head[offset - 1]):
+            offset -= 1
+        # Never the whole stem: a file called `CB_Or.nii.gz` says nothing about
+        # a subject, and an empty key would collapse every such file into one.
+        return offset if offset > 0 else index
+    return index
+
+
 def patient_stem(filename: str, also_drop=(), drop_timepoint: bool = True) -> str:
     """The subject a file belongs to, from its name alone.
 
@@ -203,6 +252,9 @@ def patient_stem(filename: str, also_drop=(), drop_timepoint: bool = True) -> st
         # it, so `A1_seg_CBMASK.nii.gz` keys to `A1` and not to `A1_CBMASK`.
         index = _token_aligned_index(stem, suffix)
         if index > 0:
+            if suffix in catalogs.ORIENTATION_SUFFIXES:
+                # And the frame it was oriented INTO goes with it too.
+                index = _frame_aligned_index(stem, index)
             stem = stem[:index]
 
     unwanted = set(also_drop)
@@ -383,10 +435,7 @@ def discover_masks(root: str, region: str) -> dict:
     """
     found: dict = {}
     wanted = catalogs.REGION_TOKENS[region]
-    # Every region's tokens, so the patient key of `P1_MAND_seg.nii.gz` is the
-    # `P1` its scan keys to rather than `P1_MAND`.
-    anatomy = {token for group in catalogs.REGION_TOKENS.values() for token in group}
-    anatomy |= set(catalogs.MASK_TOKENS)
+    anatomy = ANATOMY_TOKENS | set(catalogs.MASK_TOKENS)
 
     for directory, _, file_names in os.walk(root):
         relative = os.path.relpath(directory, root)
