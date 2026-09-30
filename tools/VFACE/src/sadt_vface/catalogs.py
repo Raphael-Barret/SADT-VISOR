@@ -97,17 +97,28 @@ REGIONS = (REGION_CRANIAL_BASE, REGION_MANDIBLE, REGION_MAXILLA)
 # second set (`TranslateModels(..., mask=True)`), and so does AREG. Sending the
 # first would hand the registration a segmentation where it expects a mask: it
 # would run, produce a transform, and report success on the wrong anatomy.
+# `code` is the three-letter name the outputs are named by -- the measurement
+# workbook is `Measurements_CB.xlsx` and every feature column starts with it --
+# so it is what the panel shows beside each option: a reader ticking a region
+# should be able to tell which file is going to carry the answer.
 REGION_TABLE = {
     REGION_CRANIAL_BASE: {
         "frame": FRAME_CRANIAL_BASE, "structure": "CBMASK", "areg": "Cranial base",
+        "code": "CB",
     },
     REGION_MANDIBLE: {
         "frame": FRAME_CRANIAL_BASE, "structure": "MANDMASK", "areg": "Mandible",
+        "code": "MAND",
     },
     REGION_MAXILLA: {
         "frame": FRAME_MAXILLA, "structure": "MAXMASK", "areg": "Maxilla",
+        "code": "MAX",
     },
 }
+
+# {display name: code}, derived so the table above stays the only place a region
+# is described. `dispatch._short` and the panel's `option_help` both read this.
+REGION_CODES = {name: entry["code"] for name, entry in REGION_TABLE.items()}
 
 
 def frames_needed(regions) -> list:

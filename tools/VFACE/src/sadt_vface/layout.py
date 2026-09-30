@@ -37,7 +37,19 @@ LAYOUT = {
     "mode": {"section": _INPUTS, "label": "Starting from"},
     "study": {"section": _INPUTS, "label": "Study"},
     "outputs": {"section": _INPUTS, "label": "What to produce"},
-    "regions": {"section": _INPUTS, "label": "Regions to measure"},
+    # Chips, the same as AMASSS's `structures` and AREG's `regions`: three lists
+    # of anatomy across this family's panels should read alike, and a clinician
+    # who ticks regions in AREG and then here is looking at one control, not two
+    # spellings of it. No `groups` -- three options are not two kinds of thing.
+    #
+    # `option_help` gives each region its code, which names the workbook the
+    # answer comes back in (`Measurements_CB.xlsx`) and prefixes every feature
+    # column, so the panel says where to look for the result.
+    "regions": {
+        "section": _INPUTS, "label": "Regions to measure",
+        "ui": "chips",
+        "option_help": dict(catalogs.REGION_CODES),
+    },
 
     "measurements": {
         "hidden": True,

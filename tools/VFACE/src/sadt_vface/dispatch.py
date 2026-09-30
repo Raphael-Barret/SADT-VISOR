@@ -288,12 +288,13 @@ def _measure(regions, baseline: dict, compared: dict, measurements: dict,
 
 
 def _short(region: str) -> str:
-    """The three-letter name the feature columns use for a region."""
-    return {
-        catalogs.REGION_CRANIAL_BASE: "CB",
-        catalogs.REGION_MANDIBLE: "MAND",
-        catalogs.REGION_MAXILLA: "MAX",
-    }[region]
+    """The three-letter name the feature columns and the output files use.
+
+    Read from `catalogs.REGION_CODES` rather than restated here: the panel shows
+    the same codes beside its check boxes, and a region described in two places
+    is a region that gets renamed in one of them.
+    """
+    return catalogs.REGION_CODES[region]
 
 
 # Which DATA folder this tool's bundles live in, and the name of each. Written

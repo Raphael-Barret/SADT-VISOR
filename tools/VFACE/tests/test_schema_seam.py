@@ -214,3 +214,41 @@ def test_every_argument_naming_a_hosted_file_is_named_so_the_server_knows():
         assert name.endswith(("_model", "_reference")), name
     for name in uploaded:
         assert not name.endswith(("_model", "_reference")), name
+
+
+# ---------------------------------------------------------------------------
+# The panel reads like its neighbours'
+# ---------------------------------------------------------------------------
+
+def test_the_regions_are_offered_the_way_amasss_and_areg_offer_anatomy():
+    """Three lists of anatomy across this family's panels, one control.
+
+    AMASSS's `structures` and AREG's `regions` are chips; a clinician who ticks
+    regions in AREG and then here should be looking at the same thing, not two
+    spellings of it. Asserted rather than left to a comment because a layout hint
+    is invisible until a panel is built, and the panel lives in another
+    repository.
+    """
+    from sadt_vface.layout import LAYOUT
+
+    assert LAYOUT["regions"]["ui"] == "chips"
+    # No `groups`: three options are not two kinds of thing, and a heading over
+    # each would say less than the chips do.
+    assert "groups" not in LAYOUT["regions"]
+
+
+def test_each_region_chip_says_which_file_will_carry_its_answer():
+    """`option_help` is the region's CODE, which names the workbook
+    (`Measurements_CB.xlsx`) and prefixes every feature column.
+
+    Read from the catalog rather than restated, so the panel and the output
+    names cannot drift apart -- which is the whole reason `REGION_CODES` is
+    derived from `REGION_TABLE` instead of written twice.
+    """
+    from sadt_vface import catalogs, dispatch
+    from sadt_vface.layout import LAYOUT
+
+    assert LAYOUT["regions"]["option_help"] == dict(catalogs.REGION_CODES)
+    # And the code the panel shows is the one the output is actually named by.
+    for region in catalogs.REGIONS:
+        assert dispatch._short(region) == catalogs.REGION_CODES[region]
