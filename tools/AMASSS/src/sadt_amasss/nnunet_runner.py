@@ -100,7 +100,21 @@ def _build_predictor(device: str, tile_step_size: float):
             options[name] = device.startswith("cuda")
             break
 
-    return nnUNetPredictor(**{k: v for k, v in options.items() if k in accepted})
+    predictor = nnUNetPredictor(**{k: v for k, v in options.items() if k in accepted})
+    # AFTER the constructor, which is what sets it: `nnUNetPredictor.__init__`
+    # turns cuDNN autotuning ON, and autotuning picks a convolution by TIMING
+    # candidates -- so the algorithm, and with it the rounding, depends on how
+    # busy the card was. Measured on this pipeline before anything overlapped:
+    # seven runs of one untouched scan produced THREE different masks, 205-265
+    # voxels apart. With structures now predicted side by side that stops being
+    # a rare coincidence and becomes the normal case.
+    #
+    # It costs Dice 0.99992 against the autotuned configuration -- roughly 270x
+    # smaller than the 0.978 the GPU resampling already costs on the same
+    # structure -- and buys a property the tool did not have: the same scan
+    # segments to the same mask whatever else the machine is doing.
+    torch.backends.cudnn.benchmark = False
+    return predictor
 
 
 # The resampler nnUNet's own plans name by default, and the only one we are

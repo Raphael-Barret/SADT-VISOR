@@ -20,7 +20,9 @@ is now its own process, so an in-process limit would cap nothing. Capping GPU
 work across concurrent jobs is the server's, and it has to be across tools.
 """
 
+from concurrent import futures
 import logging
+import multiprocessing
 import os
 import shutil
 import time
@@ -38,23 +40,56 @@ from .brain import Brain, import_torch, resolve_device
 
 logger = logging.getLogger(__name__)
 
-# Per-landmark search budget when `search_seconds` is left at 0. Each search
-# step is a forward pass, so CPU-only inference needs several times longer than
-# a GPU to reach the same place.
-_DEFAULT_BUDGET_SECONDS = {"cuda": 15.0, "cpu": 60.0}
+# Per-landmark search budget when `search_steps` is left at 0, counted in
+# FORWARD PASSES rather than in seconds.
+#
+# 900 is what the 15 s this used to allow actually bought on this card:
+# measured at 59 steps/s, while the worst SUCCESSFUL search on the reference
+# scan takes 193 steps (walk 158 + refine 35; mean 132). So the bound is 4.7x
+# the worst real search and lands where the old one did -- a landmark that was
+# found is still found, one that was not still gives up.
+#
+# It is one number for every device, where the old one had to be four times
+# larger on the CPU to buy the same search. A step count is a property of the
+# SEARCH; seconds were a property of the machine, and of how busy it was.
+_DEFAULT_SEARCH_STEPS = 900
+
+# The widest a run asks for, however much the machine could afford.
+#
+# Measured on the reference scan's 119 landmarks, card otherwise idle, every
+# width placing the same 114 points at the same coordinates:
+#
+#   width 1   358.7 s      width 8   128.0 s   (x2.80)
+#   width 4   141.3 s      width 12  127.3 s   (x2.82)
+#
+# **Eight is where the gain stops, not where the tool breaks.** Twelve buys
+# 0.7 s for three more gigabytes of card, and a run RESERVES what it is
+# granted -- so asking wider takes room from other runs and gives this one
+# nothing. Past twelve nothing is measured at all.
+#
+# It is a ceiling on the ASK, never a floor: the supervisor still answers with
+# less whenever the machine is busy, and one landmark still opens one channel.
+# A number inside a tool cannot see the machine, which is why this is the
+# largest width MEASURED to be worth having rather than a guess at what the
+# hardware can take -- the distinction this repository already draws after
+# CLIC opened thirty-three channels for a cohort of six.
+MAX_AGENT_CHANNELS = 8
 
 COMPOUND_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz")
 
 
-def search_budget(device: str, search_seconds: float = 0.0) -> float:
-    """The per-landmark time budget: the caller's, or this device's default.
+def search_budget(search_steps: int = 0) -> int:
+    """The per-landmark step budget: the caller's, or the default above.
 
     0 means "not specified" -- there is no nullable type in the schema, so the
     argument cannot default to None the way the setting it replaces did.
+
+    It takes no device any more, and that is the whole point of counting steps:
+    the same number means the same search on a laptop and on this card.
     """
-    if search_seconds and search_seconds > 0:
-        return float(search_seconds)
-    return _DEFAULT_BUDGET_SECONDS["cuda" if device.startswith("cuda") else "cpu"]
+    if search_steps and int(search_steps) > 0:
+        return int(search_steps)
+    return _DEFAULT_SEARCH_STEPS
 
 
 # numpy's legacy global seeder is the narrowest of the streams pinned below and
@@ -263,6 +298,230 @@ def _prepare_scan(scan_path: str, work_dir: str) -> dict:
     return resampled
 
 
+def _channels_for(sup, wanted: int, declared: int = 0) -> int:
+    """How many agents to walk at once: what the machine will pay for.
+
+    The tool asks for its own count -- the landmarks it was told to place --
+    and the supervisor answers with what this run's reserved share can afford,
+    floor one. A hundred and nineteen agents is never what comes back: one
+    holds its own networks on the card, so the budget clamps the answer long
+    before the ask does.
+
+    **`declared` is `num_workers`, and declaring it is what turns any of this
+    on.** The server's `execution/concurrency` is inert for a tool whose schema
+    names neither `num_workers` nor `batch_size`: it reserves no room, sets no
+    `SADT_CHANNEL_BUDGET`, and `sup.channels()` then answers 1 before doing any
+    arithmetic at all. A number the caller named is a ceiling on the ask, never
+    a floor over it -- admission reserved against what it granted.
+
+    One without a supervisor unless the caller named a number, which is how
+    this tool is run from a CLI and from its own tests: nothing has reserved
+    anything, and opening a hundred networks on an unknown card is a way to be
+    killed rather than a way to be fast.
+    """
+    wanted = max(1, min(int(wanted), MAX_AGENT_CHANNELS))
+    try:
+        declared = int(declared or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > 0:
+        wanted = min(wanted, declared)
+
+    ask = getattr(sup, "channels", None)
+    if ask is None:
+        return max(1, wanted) if declared > 0 else 1
+    try:
+        return max(1, min(wanted, int(ask(wanted))))
+    except Exception:  # noqa: BLE001 - a grant must never fail a run
+        logger.warning("Could not ask for channels; searching one at a time",
+                       exc_info=True)
+        return 1
+
+
+def _walk_on_one_thread(device: str) -> None:
+    """One CPU thread for the process that walks, and this is what makes the
+    width pay.
+
+    The volume lives in host memory, so every step crops and rescales it on
+    the CPU -- 0.9 ms of arithmetic that enters torch's intra-op pool and
+    occupies about ten cores while it does. Multiplied by the width, that is
+    more threads than the machine has cores, and the walkers spend their time
+    taking the card away from each other: measured on the full 119 landmarks,
+    width 8 came out at 425 s against 359 s for width 1, and 128.0 s once each
+    worker was held to one thread.
+
+    Called in the PARENT as well as in each worker, because the parent is what
+    walks at width 1 -- and because the server reserves against the cores a run
+    was SEEN to occupy. A run measured at 2.2 cores a channel is priced at 2.9
+    with the safety margin, so on 42 cores the ladder stops at fourteen
+    channels: the occupancy is not just waste, it is the bound on the width.
+
+    Only on the card. A CPU deployment does its FORWARD pass in this pool too
+    -- 31.6 ms on 28 threads against 143.9 ms on one -- so capping it there
+    would cost such a run 4.6x for nothing.
+    """
+    if not device.startswith("cuda"):
+        return
+    try:
+        import_torch().set_num_threads(1)
+    except Exception:  # noqa: BLE001 - a thread cap must never fail a run
+        logger.warning("Could not cap this process's torch threads", exc_info=True)
+
+
+def _agent_padding():
+    """Half a field of view plus one, so a box centred anywhere inside the
+    volume is still complete once the borders are padded."""
+    return np.array(AGENT_FOV) / 2 + 1
+
+
+def _walk_one(label, environment, weights, device, budget, seed):
+    """One agent's whole search, and the ONLY implementation of it.
+
+    Both the serial path and the pool call this, so a run at any width
+    executes the same lines in the same order -- which is what makes "the
+    width does not move a coordinate" a property of the code rather than a
+    claim about it.
+    """
+    brain = Brain(catalog.SCALE_KEYS, device, out_channels=MOVEMENT_COUNT)
+    try:
+        brain.load(weights[label])
+        agent = Agent(
+            target=label,
+            scale_keys=catalog.SCALE_KEYS,
+            brain=brain,
+            environment=environment,
+            # Per landmark, not per scan: see agent.rng_for. This is what lets
+            # the agents run in any order, or at once, without the answer
+            # depending on which OTHER landmarks were asked for.
+            rng=rng_for(label, seed),
+        )
+        return agent.search(budget), None
+    except NotFound as exc:
+        # At INFO, not DEBUG: these are rare (6 of 119 on the reference scan)
+        # and they are exactly what someone watching the log wants to see,
+        # without having to open the archive to find out.
+        logger.info("  %s: not found -- %s", label, exc)
+        return None, str(exc)
+    except Exception as exc:  # noqa: BLE001 - one landmark, not the scan
+        # A broken checkpoint, an out-of-memory, anything: this landmark is
+        # lost, the rest of the scan is not.
+        logger.exception("Landmark search raised for '%s'", label)
+        return None, f"{type(exc).__name__}: {exc}"
+    finally:
+        brain.release()
+
+
+# **The agents walk in separate PROCESSES, and threads are not an oversight.**
+#
+# They were measured twice and refused twice. A thread pool over the same
+# agents is x1.04 on this card, because a step is 15.5 ms of which 15.2 is the
+# forward pass and essentially all of that is spent holding the GIL inside
+# torch's dispatch -- the C++ that actually releases it is a few hundred
+# microseconds of kernel. There is nothing for a second thread to overlap
+# with. Processes have no such ceiling: 353.8 s at width 1, 210.1 s at width 2,
+# 169.1 s at width 4, measured on this engine.
+#
+# The price is real and is paid once per worker: a spawned child builds its own
+# CUDA context (~3 s) and loads its own copy of the scan. So the pool is
+# created ONCE for the run, not once per scan, and a worker keeps the
+# environment it built until the scan changes under it.
+_WORKER = {}
+
+
+def _worker_setup(device, padding, weights, budget, seed) -> None:
+    """Called once in each spawned child, before any landmark reaches it."""
+    _WORKER.update(
+        device=device, padding=padding, weights=weights, budget=budget,
+        seed=seed, images=None, environment=None,
+    )
+    # The walk draws only from `agent.rng_for`, so this seeds nothing the
+    # search depends on. It is set anyway because a child that imports torch
+    # inherits no global state at all under `spawn`, and an unseeded one would
+    # be the single hardest thing to notice if that ever stopped being true.
+    seed_everything(seed)
+
+    _walk_on_one_thread(device)
+
+
+def _worker_environment(images, key):
+    """This process's volumes for one scan, loaded once and then reused.
+
+    Keyed on `images` -- the {scale: path} mapping -- rather than on the scan
+    index, so a worker that never saw a scan loads it and one that already has
+    it does not. Across a cohort each worker pays one load per scan, never one
+    per landmark.
+    """
+    if _WORKER.get("images") != images:
+        _worker_release()
+        from .environment import Environment
+
+        environment = Environment(
+            patient_id=key, padding=_WORKER["padding"], device=_WORKER["device"],
+        )
+        environment.load_images(images)
+        _WORKER["environment"] = environment
+        _WORKER["images"] = images
+    return _WORKER["environment"]
+
+
+def _worker_release() -> None:
+    environment = _WORKER.get("environment")
+    if environment is not None:
+        environment.release()
+    _WORKER["environment"] = None
+    _WORKER["images"] = None
+
+
+def _worker_walk(task):
+    """One task: place one landmark on one scan, in this child."""
+    images, key, label = task
+    environment = _worker_environment(images, key)
+    return _walk_one(
+        label, environment, _WORKER["weights"], _WORKER["device"],
+        _WORKER["budget"], _WORKER["seed"],
+    )
+
+
+def _walk_in_pool(pool, images, key, runnable, announce):
+    """Hand every landmark to the workers; return what came back, and whether
+    the pool survived.
+
+    **A process pool has a failure mode a thread pool does not**, and it is the
+    reason this returns a flag rather than raising. A worker that is KILLED --
+    the host out of memory, an operator, the card -- breaks the executor
+    permanently: every pending future fails at once and every later `submit`
+    raises, so one dead worker would otherwise cost the rest of the cohort and
+    not just the landmark it was holding. What comes back here is therefore
+    partial by design, and the caller finishes the remainder in this process.
+    """
+    results = {}
+    broken = False
+    pending = {}
+    try:
+        for label in runnable:
+            pending[pool.submit(_worker_walk, (images, key, label))] = label
+    except Exception:  # noqa: BLE001 - a dead pool is not a failed run
+        logger.exception("Could not hand the landmarks to the agent pool")
+        broken = True
+
+    for future in futures.as_completed(pending):
+        label = pending[future]
+        try:
+            results[label] = future.result()
+        except futures.BrokenExecutor:
+            # Not this landmark's fault and not recorded against it: it is
+            # walked again below, in this process, and only a real NotFound
+            # should ever reach the run report.
+            broken = True
+        except Exception as exc:  # noqa: BLE001 - one landmark, not the scan
+            # `_walk_one` catches everything a search itself can raise, so
+            # reaching here means the call did not survive the trip.
+            logger.exception("Landmark search did not come back for '%s'", label)
+            results[label] = (None, f"{type(exc).__name__}: {exc}")
+        announce(len(results))
+    return results, broken
+
+
 def predict_landmarks(
     scans: list,
     model_path: str,
@@ -272,8 +531,10 @@ def predict_landmarks(
     output_dir: str = None,
     work_dir: str = None,
     device: str = None,
-    search_seconds: float = 0.0,
+    search_steps: int = 0,
     seed: int = 0,
+    num_workers: int = 0,
+    sup=None,
 ) -> dict:
     """Place landmarks on every scan; return the run report.
 
@@ -294,10 +555,14 @@ def predict_landmarks(
 
     check_dependencies()
     device = resolve_device(device)
+    # Before anything walks, and in this process too: at width 1 the parent IS
+    # the walker, and the pool it would otherwise open is what the cost table
+    # then reads back as cores this run needs.
+    _walk_on_one_thread(device)
     regions = tuple(regions) if regions is not None else catalog.REGION_CODES
     landmarks = tuple(landmarks or ())
     prediction_ID = (prediction_ID or "Pred").strip() or "Pred"
-    budget = search_budget(device, search_seconds)
+    budget = search_budget(search_steps)
 
     seed = int(seed)
     if not 0 <= seed <= _MAX_SEED:
@@ -337,70 +602,52 @@ def predict_landmarks(
         "ALI CBCT: %d scan(s), %d landmark(s), device=%s", len(scans), len(runnable), device
     )
 
-    scan_reports = {}
-    for scan_index, (scan_path, key) in enumerate(scans, start=1):
-        record = {
-            "input": os.path.basename(scan_path),
-            "status": "pending",
-            "landmarks_found": [],
-            "landmarks_failed": {},
-            "produced": [],
-        }
-        scan_reports[key] = record
-        scan_started = time.monotonic()
-        # Position in the batch, never the scan's name: a file name is patient
-        # metadata and this server does not write it to a log -- and the same
-        # rule is why the progress event carries the counter and nothing else.
-        logger.info("scan %d/%d: preprocessing", scan_index, len(scans))
-        progress.report(scan_index, len(scans), "scan")
+    # Asked once for the run, not once per scan: the grant is a property of
+    # what admission reserved, and re-asking per scan would only repeat it.
+    width = _channels_for(sup, len(runnable), num_workers)
+    logger.info("ALI CBCT: walking %d agent(s) %d at a time", len(runnable), width)
+    # Declared around the search and nowhere else: the peak is there -- one
+    # agent's networks per channel -- and the preprocessing either side is
+    # serial. A record without a width is ignored by the server rather than
+    # read as one, which is what lets a tool speak only where it has something
+    # to say.
+    progress.set_width(width)
 
-        try:
-            _predict_one_scan(
-                scan_path=scan_path,
-                key=key,
-                record=record,
-                weights=weights,
-                runnable=runnable,
-                device=device,
-                budget=budget,
-                preprocessed_dir=preprocessed_dir,
-                output_dir=output_dir,
-                prediction_ID=prediction_ID,
-                scan_index=scan_index,
-                scan_total=len(scans),
-                seed=seed,
-            )
-            # NOT unconditionally "ok". A per-landmark failure is recorded in
-            # `landmarks_failed` and does not raise -- deliberately, since a
-            # truncated field of view legitimately misses points and one hard
-            # landmark must not cost the other 57. But a scan on which EVERY
-            # agent failed placed nothing at all, and calling that a success is
-            # how a run that produced no coordinates reports 200.
-            if record["landmarks_found"]:
-                record["status"] = "ok"
-            else:
-                record["status"] = "failed"
-                record["error"] = (
-                    "no landmark could be placed on this scan: "
-                    f"{len(record['landmarks_failed'])} of "
-                    f"{len(runnable)} agent(s) failed to converge."
-                )
-        except Exception as exc:
-            # One unreadable or hopeless scan must not cost the other 199.
-            logger.exception("ALI CBCT failed on one scan")
-            record["status"] = "failed"
-            record["error"] = str(exc)
-        record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
-        logger.info(
-            "scan %d/%d: %s -- %d found, %d failed, %.0fs",
-            scan_index,
-            len(scans),
-            record["status"],
-            len(record["landmarks_found"]),
-            len(record["landmarks_failed"]),
-            record["duration_seconds"],
+    # `spawn`, not the platform default: a forked child inherits a CUDA context
+    # it cannot use, and the first allocation in it fails. Every worker builds
+    # its own, which is most of what a channel costs on the card.
+    pool = None
+    if width > 1 and len(runnable) > 1:
+        pool = futures.ProcessPoolExecutor(
+            max_workers=width,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_setup,
+            initargs=(device, _agent_padding(), weights, budget, seed),
         )
 
+    scan_reports = {}
+    try:
+        _predict_every_scan(
+            scans=scans, scan_reports=scan_reports, weights=weights,
+            runnable=runnable, device=device, budget=budget,
+            preprocessed_dir=preprocessed_dir, output_dir=output_dir,
+            prediction_ID=prediction_ID, seed=seed, pool=pool,
+        )
+    finally:
+        # Before the report is built, and on the failure path too: a pool left
+        # open holds `width` processes, each with a CUDA context and a copy of
+        # the last scan, for as long as this interpreter lives.
+        if pool is not None:
+            pool.shutdown(wait=True)
+        progress.set_width(None)
+
+    processed = [record for record in scan_reports.values() if record["status"] == "ok"]
+    if not processed:
+        first_error = next(
+            (record.get("error") for record in scan_reports.values() if record.get("error")),
+            "unknown",
+        )
+        raise RuntimeError(f"ALI produced no landmarks for any scan. First error: {first_error}")
     processed = [record for record in scan_reports.values() if record["status"] == "ok"]
     if not processed:
         first_error = next(
@@ -468,11 +715,96 @@ def predict_landmarks(
     }
 
 
+def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
+                        preprocessed_dir, output_dir, prediction_ID, seed,
+                        pool) -> None:
+    """Walk the cohort, recording one report per scan.
+
+    Split out of `predict_landmarks` so the process pool can be opened and
+    closed around the whole loop in one `try/finally`, rather than per scan --
+    a worker's CUDA context costs about three seconds to build, and a cohort
+    would pay it once per patient.
+    """
+    for scan_index, (scan_path, key) in enumerate(scans, start=1):
+        record = {
+            "input": os.path.basename(scan_path),
+            "status": "pending",
+            "landmarks_found": [],
+            "landmarks_failed": {},
+            "produced": [],
+        }
+        scan_reports[key] = record
+        scan_started = time.monotonic()
+        # Position in the batch, never the scan's name: a file name is patient
+        # metadata and this server does not write it to a log -- and the same
+        # rule is why the progress event carries the counter and nothing else.
+        logger.info("scan %d/%d: preprocessing", scan_index, len(scans))
+        progress.report(scan_index, len(scans), "scan")
+
+        try:
+            broken = _predict_one_scan(
+                scan_path=scan_path,
+                key=key,
+                record=record,
+                weights=weights,
+                runnable=runnable,
+                device=device,
+                budget=budget,
+                preprocessed_dir=preprocessed_dir,
+                output_dir=output_dir,
+                prediction_ID=prediction_ID,
+                scan_index=scan_index,
+                scan_total=len(scans),
+                seed=seed,
+                pool=pool,
+            )
+            if broken:
+                # A broken executor never recovers: every later `submit`
+                # raises. Dropping it here costs the rest of the cohort the
+                # width, and saves it the scan-long fallback this one just
+                # paid.
+                pool = None
+            # NOT unconditionally "ok". A per-landmark failure is recorded in
+            # `landmarks_failed` and does not raise -- deliberately, since a
+            # truncated field of view legitimately misses points and one hard
+            # landmark must not cost the other 57. But a scan on which EVERY
+            # agent failed placed nothing at all, and calling that a success is
+            # how a run that produced no coordinates reports 200.
+            if record["landmarks_found"]:
+                record["status"] = "ok"
+            else:
+                record["status"] = "failed"
+                record["error"] = (
+                    "no landmark could be placed on this scan: "
+                    f"{len(record['landmarks_failed'])} of "
+                    f"{len(runnable)} agent(s) failed to converge."
+                )
+        except Exception as exc:
+            # One unreadable or hopeless scan must not cost the other 199.
+            logger.exception("ALI CBCT failed on one scan")
+            record["status"] = "failed"
+            record["error"] = str(exc)
+        record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
+        logger.info(
+            "scan %d/%d: %s -- %d found, %d failed, %.0fs",
+            scan_index,
+            len(scans),
+            record["status"],
+            len(record["landmarks_found"]),
+            len(record["landmarks_failed"]),
+            record["duration_seconds"],
+        )
+
+
+
 def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
                       preprocessed_dir, output_dir, prediction_ID,
                       scan_index: int = 1, scan_total: int = 1,
-                      seed: int = 0) -> None:
+                      seed: int = 0, pool=None) -> bool:
     """Preprocess one scan, run every requested landmark on it, write its file.
+
+    Returns whether the agent pool broke under it, so the cohort stops handing
+    work to an executor that can no longer take any.
 
     Logs progress as it goes. The search is the long part -- 119 landmarks is
     minutes of it -- and without a line in between, a run is indistinguishable
@@ -493,12 +825,11 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
     # one per landmark would be 119 lines here and 23 800 on a 200-scan batch.
     progress_every = max(1, len(runnable) // 10)
 
+    # Loaded in the parent even when the pool does the walking: it is what
+    # turns a voxel position back into the scanner's millimetres, and doing
+    # that conversion in ONE place is what makes every width agree exactly.
     environment = Environment(
-        patient_id=key,
-        # Half a field of view plus one, so a box centred anywhere inside the
-        # volume is still complete once the borders are padded.
-        padding=np.array(AGENT_FOV) / 2 + 1,
-        device=device,
+        patient_id=key, padding=_agent_padding(), device=device,
     )
 
     positions = {}
@@ -506,55 +837,71 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         environment.load_images(images)
 
         search_started = time.monotonic()
-        for index, label in enumerate(runnable, start=1):
-            brain = Brain(catalog.SCALE_KEYS, device, out_channels=MOVEMENT_COUNT)
-            try:
-                brain.load(weights[label])
-                agent = Agent(
-                    target=label,
-                    scale_keys=catalog.SCALE_KEYS,
-                    brain=brain,
-                    environment=environment,
-                    # Per landmark, not per scan: see agent.rng_for. A scan's
-                    # own identity is deliberately NOT in here -- the same
-                    # landmark on two patients should not have to share a
-                    # spawn sequence to be reproducible, and a batch must give
-                    # each scan the answer it would have got on its own.
-                    rng=rng_for(label, seed),
-                )
-                voxel_position = agent.search(budget)
-            except NotFound as exc:
-                # At INFO, not DEBUG: these are rare (6 of 119 on the reference
-                # scan) and they are exactly what someone watching the log wants
-                # to see, without having to open the archive to find out.
-                logger.info("  %s: not found -- %s", label, exc)
-                record["landmarks_failed"][label] = str(exc)
-                continue
-            except Exception as exc:
-                # A broken checkpoint, an out-of-memory, anything: this
-                # landmark is lost, the rest of the scan is not.
-                logger.exception("Landmark search raised for '%s'", label)
-                record["landmarks_failed"][label] = f"{type(exc).__name__}: {exc}"
-                continue
-            finally:
-                brain.release()
 
+        # **The agents walk side by side, and that cannot move a coordinate.**
+        # Two properties of this engine make it safe, and both were written
+        # for other reasons:
+        #
+        #   * an agent's random stream is derived from the LANDMARK's name
+        #     (`agent.rng_for`), never from a stream shared by the scan, "so
+        #     that a landmark's result depends only on (scan, weights, seed)
+        #     -- never on which OTHER landmarks were asked for". Order cannot
+        #     reach the answer.
+        #   * the `Environment` is read-only during a search. Everything the
+        #     walk mutates -- position, scale, speed, attempts, the short
+        #     memory -- lives on the Agent, and each one has its own Brain.
+        #     `predicted_landmarks` is the only dictionary written, one key per
+        #     agent, and nothing in this engine ever reads it.
+        #
+        # A worker is a PROCESS, so it holds its own copy of both. The Brain is
+        # built and released around each landmark, so at most one set of
+        # networks per worker is resident whatever the number of agents.
+
+        def announce(index):
+            """One line every tenth of the batch, wherever the workers are."""
+            if index % progress_every and index != len(runnable):
+                return
+            elapsed = time.monotonic() - search_started
+            logger.info(
+                "scan %d/%d: %d/%d landmarks, %.0fs elapsed, ~%.0fs left",
+                scan_index, scan_total, index, len(runnable), elapsed,
+                (elapsed / index) * (len(runnable) - index),
+            )
+
+        results, broken = ({}, False)
+        if pool is not None and len(runnable) > 1:
+            results, broken = _walk_in_pool(pool, images, key, runnable, announce)
+            if broken:
+                logger.warning(
+                    "The agent pool stopped answering after %d of %d "
+                    "landmark(s); finishing this scan one at a time. A worker "
+                    "was killed -- the host out of memory, most often.",
+                    len(results), len(runnable),
+                )
+
+        # Whatever the pool did not return, including everything when there is
+        # no pool at all. One loop, so the serial path is not a second
+        # implementation that could drift from the parallel one.
+        for label in runnable:
+            if label in results:
+                continue
+            results[label] = _walk_one(
+                label, environment, weights, device, budget, seed
+            )
+            announce(len(results))
+
+        # Read back in `runnable` order, so `landmarks_found` lists the points
+        # in the order the run asked for them and not the order the machine
+        # happened to return them.
+        for label in runnable:
+            voxel_position, error = results[label]
+            if error is not None:
+                record["landmarks_failed"][label] = error
+                continue
             positions[label] = environment.physical_position(
                 catalog.SCALE_KEYS[-1], voxel_position
             )
             record["landmarks_found"].append(label)
-            logger.debug("  %s: found", label)
-
-            if index % progress_every == 0 or index == len(runnable):
-                elapsed = time.monotonic() - search_started
-                remaining = (elapsed / index) * (len(runnable) - index)
-                logger.info(
-                    "scan %d/%d: %d/%d landmarks (%d found, %d failed), "
-                    "%.0fs elapsed, ~%.0fs left",
-                    scan_index, scan_total, index, len(runnable),
-                    len(record["landmarks_found"]), len(record["landmarks_failed"]),
-                    elapsed, remaining,
-                )
     finally:
         environment.release()
         # Deleted per scan rather than left to the end of the run: three
@@ -572,3 +919,4 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         f"{scan_stem(os.path.basename(scan_path))}_lm_{prediction_ID}{MARKUPS_EXTENSION}",
     )
     record["produced"].append(write_markups(positions, destination))
+    return broken

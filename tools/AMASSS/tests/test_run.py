@@ -615,7 +615,7 @@ def test_surfaces_are_written_as_binary_vtk(tmp_path):
     reference.SetSpacing((0.4, 0.4, 0.4))
 
     output = str(tmp_path / "surface.vtk")
-    mesh = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (216, 101, 79))
+    mesh = vtk_export._mesh_from_mask(volume, reference, 5, (216, 101, 79))
     vtk_export._write(mesh, output)
 
     with open(output, "rb") as handle:
@@ -637,15 +637,58 @@ def test_surfaces_are_written_as_binary_vtk(tmp_path):
     )
 
 
-def test_mesh_temp_file_does_not_outlive_the_call(tmp_path):
-    """The scratch .nrrd used to have a fixed name and was never removed."""
+def test_the_mask_reaches_vtk_without_touching_the_disk(tmp_path):
+    """It used to be written out as a `.nrrd` and read back by vtkNrrdReader:
+    96 MB out and 96 MB in per mask, eighteen masks per scan on a full run, to
+    move a buffer that was already in memory. The scratch file also had a fixed
+    name once, and was never removed."""
     volume = np.zeros((20, 20, 20), dtype=np.uint8)
     volume[5:15, 5:15, 5:15] = 1
     reference = sitk.GetImageFromArray(volume)
 
-    vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 3, (1, 2, 3))
+    mesh = vtk_export._mesh_from_mask(volume, reference, 3, (1, 2, 3))
 
-    assert list(tmp_path.glob("*.nrrd")) == []
+    assert mesh.GetNumberOfCells() > 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_contour_is_the_same_surface_the_discrete_filter_gave(tmp_path):
+    """`vtkFlyingEdges3D` at 0.5 replaced `vtkDiscreteMarchingCubes`, and the
+    brief was that no clinical output moves. On a 0/1 mask the 0.5 isosurface
+    crosses every edge at its midpoint, which is where the discrete filter put
+    its vertices -- so the two are equal, not merely close. Verified on a real
+    mandible of 589 934 triangles; pinned here on something a test can afford.
+    """
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    volume = np.zeros((30, 30, 30), dtype=np.uint8)
+    zz, yy, xx = np.ogrid[:30, :30, :30]
+    volume[((zz - 15) ** 2 + (yy - 15) ** 2 + (xx - 15) ** 2) < 100] = 1
+    reference = sitk.GetImageFromArray(volume)
+    reference.SetSpacing((0.4, 0.4, 0.4))
+    image = vtk_export._image_from_mask(volume, reference)
+
+    discrete = vtk.vtkDiscreteMarchingCubes()
+    discrete.SetInputData(image)
+    discrete.GenerateValues(1, 1, 1)
+    discrete.Update()
+    flying = vtk.vtkFlyingEdges3D()
+    flying.SetInputData(image)
+    flying.SetValue(0, 0.5)
+    flying.Update()
+
+    def triangles(poly):
+        points = vtk_to_numpy(poly.GetPoints().GetData())
+        cells = vtk_to_numpy(poly.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
+        # Vertices sorted inside each triangle and triangles sorted between
+        # them: the same surface emitted in a different order is the same
+        # surface, and that is what has to hold.
+        flat = np.sort(points[cells].round(6), axis=1).reshape(-1, 9)
+        return flat[np.lexsort(flat.T[::-1])]
+
+    assert discrete.GetOutput().GetNumberOfCells() == flying.GetOutput().GetNumberOfCells()
+    assert np.array_equal(triangles(discrete.GetOutput()), triangles(flying.GetOutput()))
 
 
 def test_decimation_reduces_triangles_and_zero_disables_it(tmp_path):
@@ -658,8 +701,8 @@ def test_decimation_reduces_triangles_and_zero_disables_it(tmp_path):
     reference = sitk.GetImageFromArray(volume)
     reference.SetSpacing((0.4, 0.4, 0.4))
 
-    raw = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 0)
-    reduced = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 90)
+    raw = vtk_export._mesh_from_mask(volume, reference, 5, (1, 2, 3), 0)
+    reduced = vtk_export._mesh_from_mask(volume, reference, 5, (1, 2, 3), 90)
 
     assert raw.GetNumberOfCells() > 0
     assert reduced.GetNumberOfCells() < raw.GetNumberOfCells() / 2
@@ -883,3 +926,327 @@ def test_a_missing_prediction_is_logged_by_case_id(tmp_path, monkeypatch, caplog
     assert "No MAND prediction for p_001" in messages, messages
     assert "Failed to assemble outputs for scan 2 of 2" in messages, messages
     assert not any("Zulu_Zoe" in m or "Adams_Ann" in m for m in messages), messages
+
+
+# ---------------------------------------------------------------------------
+# Structures side by side
+#
+# One nnUNet call is a third inference and two thirds preprocessing, so a run
+# left the card idle 78 % of its own length. Structures are the honest axis for
+# that: separate models over the same read-only input folder, each writing to a
+# directory of its own.
+# ---------------------------------------------------------------------------
+
+class _Supervisor:
+    """The one member of the supervisor this tool uses."""
+
+    def __init__(self, grant):
+        self.grant = grant
+        self.asked = []
+
+    def channels(self, wanted=0):
+        self.asked.append(wanted)
+        return self.grant
+
+
+def test_it_asks_for_one_channel_per_structure_it_was_told_to_produce():
+    sup = _Supervisor(grant=5)
+    assert pipeline._channels_for(sup, 5) == 5
+    assert sup.asked == [5]
+
+
+def test_a_narrower_grant_is_what_it_takes():
+    """The whole bargain: a busy server narrows the run instead of refusing
+    it."""
+    assert pipeline._channels_for(_Supervisor(grant=2), 5) == 2
+
+
+def test_a_grant_wider_than_the_work_is_capped_at_the_work():
+    assert pipeline._channels_for(_Supervisor(grant=8), 3) == 3
+
+
+def test_without_a_supervisor_it_predicts_one_at_a_time():
+    """Which is how this tool is run from a CLI and from its own tests --
+    nothing has reserved anything, and opening five nnUNet predictors on an
+    unknown card is a way to be killed rather than a way to be fast."""
+    assert pipeline._channels_for(None, 5) == 1
+
+
+def test_a_supervisor_that_raises_costs_the_width_and_not_the_run():
+    class _Broken:
+        def channels(self, wanted=0):
+            raise RuntimeError("no budget service")
+
+    assert pipeline._channels_for(_Broken(), 5) == 1
+
+
+def _overlap_recording_predictor(monkeypatch, stub_predictor_fn):
+    """Wrap the stub so it records how many predictions were ever in flight."""
+    import threading
+
+    state = {"running": 0, "peak": 0}
+    lock = threading.Lock()
+    started = threading.Barrier(2, timeout=5)
+
+    def recording(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        try:
+            # Both structures have to be inside at once for the barrier to
+            # clear, so this FAILS rather than passing by luck on a machine
+            # that happened to schedule them one after the other.
+            started.wait()
+        except threading.BrokenBarrierError:
+            pass
+        stub_predictor_fn(model_folder, input_dir, output_dir, device, **kwargs)
+        with lock:
+            state["running"] -= 1
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", recording)
+    return state
+
+
+def test_two_structures_are_predicted_at_once_when_the_machine_pays_for_two(
+    tmp_path, stub_predictor, monkeypatch
+):
+    state = _overlap_recording_predictor(
+        monkeypatch, nnunet_runner.predict_folder)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    assert state["peak"] == 2, "the structures ran one after the other"
+
+
+def test_with_no_supervisor_they_do_not_overlap(tmp_path, stub_predictor, monkeypatch):
+    """The floor is one, so the CLI and the tests behave exactly as before."""
+    import threading
+
+    state = {"running": 0, "peak": 0}
+    lock = threading.Lock()
+    inner = nnunet_runner.predict_folder
+
+    def recording(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        inner(model_folder, input_dir, output_dir, device, **kwargs)
+        with lock:
+            state["running"] -= 1
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", recording)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    assert state["peak"] == 1
+
+
+def test_one_structure_failing_still_loses_only_that_one_in_a_pool(
+    tmp_path, stub_predictor, monkeypatch
+):
+    inner = nnunet_runner.predict_folder
+
+    def fail_MAX(model_folder, input_dir, output_dir, device, **kwargs):
+        if os.path.basename(os.path.normpath(model_folder)) == "MAX" or "MAX" in model_folder:
+            raise RuntimeError("no model")
+        inner(model_folder, input_dir, output_dir, device, **kwargs)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", fail_MAX)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    assert any("MAND" in path for path in segmentation_files(report))
+    assert not any("MAX" in path for path in segmentation_files(report))
+
+
+def test_the_bar_counts_finished_structures_not_started_ones(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """With a pool every structure starts at once, so a bar driven off starts
+    jumps to full and then sits there for the length of the run."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    messages = [json.loads(line)["message"] for line in
+                events_file.read_text().splitlines()]
+    structures = [m for m in messages if "structure" in m]
+    assert structures == ["structure 1 of 2", "structure 2 of 2"], structures
+
+
+def test_cudnn_autotuning_is_turned_back_off_after_the_predictor_is_built():
+    """`nnUNetPredictor.__init__` turns it ON, and autotuning picks a
+    convolution by TIMING candidates -- so the algorithm, and with it the
+    rounding, depends on how busy the card was. Seven runs of one untouched
+    scan produced three different masks, 205-265 voxels apart. With structures
+    now predicted side by side that stops being a rare coincidence.
+    """
+    import torch
+
+    torch.backends.cudnn.benchmark = True
+
+    nnunet_runner._build_predictor("cpu", tile_step_size=0.5)
+
+    assert torch.backends.cudnn.benchmark is False
+
+
+def test_a_caller_named_number_is_a_ceiling_on_the_ask_not_a_floor_over_it():
+    """Admission reserved against what it granted, so a tool spreading wider
+    than its own share would spend memory nobody set aside."""
+    sup = _Supervisor(grant=8)
+
+    assert pipeline._channels_for(sup, 5, declared=2) == 2
+    assert sup.asked == [2], "it asked for more than the caller allowed"
+
+
+def test_without_a_supervisor_a_named_number_is_the_one_that_decides():
+    """A CLI, a test: nothing has reserved anything, so the only number left
+    is the one the caller typed."""
+    assert pipeline._channels_for(None, 5, declared=3) == 3
+    assert pipeline._channels_for(None, 2, declared=9) == 2
+    assert pipeline._channels_for(None, 5, declared=0) == 1
+
+
+def test_the_width_is_declared_only_where_it_is_actually_in_force(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """A MEASUREMENT, not the permission. The server keeps the NARROWEST width
+    it was told and divides the run's peak by it; a record with no width is
+    ignored rather than read as one. So the phase that has a width declares it
+    and the serial phases either side stay silent -- and the peak, which is one
+    nnUNet model per channel, lands inside the phase that declared it.
+
+    Told nothing, the whole peak is priced as a single channel: every run after
+    this one is reserved for five channels' worth and then granted fewer.
+    """
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines()]
+    widths = {r["message"].split()[0]: r.get("width") for r in records}
+    assert widths["structure"] == 2, widths
+    # The narrowest width the server would keep is the only one declared.
+    declared = [r["width"] for r in records if "width" in r]
+    assert declared and min(declared) == 2, records
+    assert widths.get("reading") is None
+    assert widths.get("writing") is None
+
+
+def test_a_serial_run_declares_one_and_not_nothing(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """Width one IS a measurement -- it is the fixed cost, and the fit needs
+    that column as much as it needs a wide one."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines()]
+    declared = [r["width"] for r in records if "width" in r]
+    assert declared and min(declared) == 1, records
+
+
+def test_meshes_built_side_by_side_come_back_in_the_order_they_were_asked_for():
+    """The threads finish in whatever order the machine gives them; the file a
+    clinician opens must not. `_meshes_in_parallel` is what the merged surface
+    appends from and what names the separate ones, so its order IS the output's
+    order."""
+    volume = np.zeros((24, 24, 24), dtype=np.uint8)
+    reference = sitk.GetImageFromArray(volume)
+    jobs = []
+    for index, size in enumerate((4, 6, 8, 10)):
+        mask = np.zeros((24, 24, 24), dtype=np.uint8)
+        mask[2:2 + size, 2:2 + size, 2:2 + size] = 1
+        jobs.append((mask, reference, 1, (index, index, index), 0))
+
+    serial = vtk_export._meshes_in_parallel(jobs, workers=1)
+    threaded = vtk_export._meshes_in_parallel(jobs, workers=4)
+
+    assert [m.GetNumberOfCells() for m in serial] == [m.GetNumberOfCells() for m in threaded]
+    assert [m.GetNumberOfCells() for m in serial] == sorted(
+        m.GetNumberOfCells() for m in serial), "the fixture should grow monotonically"
+
+
+def test_the_separate_surfaces_are_named_after_their_own_structure(tmp_path):
+    """Built in a pool, written in the mapping's order -- so a surface cannot
+    end up carrying another structure's name because its thread came back
+    first."""
+    reference = sitk.GetImageFromArray(np.zeros((20, 20, 20), dtype=np.uint8))
+    masks = {}
+    for index, code in enumerate(("MAND", "MAX", "CB")):
+        mask = np.zeros((20, 20, 20), dtype=np.uint8)
+        mask[2:2 + 4 + index * 3, 2:2 + 4 + index * 3, 2:2 + 4 + index * 3] = 1
+        masks[code] = mask
+
+    from sadt_amasss.catalog import LABEL_COLORS, LABELS
+
+    written = vtk_export.write_separate_surfaces(
+        masks=masks, reference=reference, label_colors=LABEL_COLORS, labels=LABELS,
+        smoothing=1, decimation=0, output_dir=str(tmp_path),
+        name_of=lambda code: f"p_{code}.vtk", workers=3,
+    )
+
+    assert [os.path.basename(p) for p in written] == ["p_MAND.vtk", "p_MAX.vtk", "p_CB.vtk"]
+    assert all(os.path.isfile(p) for p in written)

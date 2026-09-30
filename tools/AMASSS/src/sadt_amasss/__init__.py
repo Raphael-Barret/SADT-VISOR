@@ -36,6 +36,9 @@ def run(
     device: Literal["cuda", "cpu"] = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    num_workers: int = 0,
+    *,
+    sup=None,
 ) -> Path:
     """Segment craniofacial structures on a CBCT scan.
 
@@ -73,6 +76,12 @@ def run(
             Roughly seven times less time in resampling, which is where a run
             actually goes. Ignored on CPU and for a bundle whose plans pin a
             non-default resampler. Set false for bit-identical nnUNet output.
+        num_workers: How many structures to predict at once. 0 lets the server
+            decide from the room it reserved for this run, which is the normal
+            case; a number is a ceiling on that, never a floor over it. One
+            structure is one nnUNet model resident on the card, and a run is
+            two thirds preprocessing on a single core -- which is the idle time
+            this fills.
 
     Returns:
         The output directory, holding one folder per scan plus the run report.
@@ -94,5 +103,7 @@ def run(
         device=device,
         tile_step_size=tile_step_size,
         gpu_resampling=gpu_resampling,
+        num_workers=num_workers,
+        sup=sup,
     )
     return output_dir

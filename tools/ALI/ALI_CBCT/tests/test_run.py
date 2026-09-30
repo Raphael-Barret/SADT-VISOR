@@ -719,18 +719,75 @@ def test_the_marker_is_constant_and_is_what_the_tool_publishes(
 
 
 # ---------------------------------------------------------------------------
-# `search_seconds` -- the setting that became an argument
+# `search_steps` -- a budget in forward passes, not in seconds
 # ---------------------------------------------------------------------------
 
-def test_the_search_budget_defaults_per_device():
+def test_the_search_budget_is_one_number_for_every_device():
     """0 means "not specified": there is no nullable type in the schema, so the
-    argument cannot default to None the way the setting it replaces did."""
+    argument cannot default to None the way the setting it replaces did.
+
+    And it takes no device, which is the point of counting steps: seconds were
+    a property of the machine and of how busy it was, so the same request was
+    a different search on a contended card. A step is a forward pass.
+    """
     from sadt_ali_cbct import engine as cbct_engine
 
-    assert cbct_engine.search_budget("cuda", 0.0) == 15.0
-    # CPU inference needs several times longer to reach the same place.
-    assert cbct_engine.search_budget("cpu", 0.0) == 60.0
-    assert cbct_engine.search_budget("cuda", 2.5) == 2.5
+    assert cbct_engine.search_budget(0) == cbct_engine._DEFAULT_SEARCH_STEPS
+    assert cbct_engine.search_budget(250) == 250
+    # Comfortably above the worst search measured on the reference scan (193
+    # steps), or a landmark that used to be found would start being lost.
+    assert cbct_engine._DEFAULT_SEARCH_STEPS > 4 * 193
+
+
+def test_both_search_loops_are_bounded_by_the_same_step_budget():
+    """The walk and the six-offset refinement share one budget, and BOTH have
+    to honour it.
+
+    The refinement is the loop that mattered: it used to be `while not found`
+    with nothing to stop it, and an agent that respawns clears the memory
+    convergence is detected from. Counting in `_step` -- the only place a
+    forward pass happens -- is what makes one budget cover both.
+    """
+    import numpy as np
+
+    from sadt_ali_cbct.agent import Agent, NotFound
+
+    class _OneScaleVolume:
+        """Enough environment for the two loops; the walk itself is stubbed."""
+
+        scale_count = 1
+
+        def size(self, _scale):
+            return np.array([64, 64, 64])
+
+    # `walk`: never converges, so `search`'s own loop must run out of steps.
+    # `refine`: converges ONCE -- enough to leave the walk -- and never again,
+    # which is the shape of a respawning agent and is what `_focus` has to
+    # survive. It is also the case that used to hang: before the budget
+    # reached it, this loop was `while not self._step()` with no way out.
+    for phase, converge_once in (("walk", False), ("refine", True)):
+        taken = []
+
+        class _Bounded(Agent):
+            def _step(self):
+                taken.append(1)
+                self._steps_left -= 1
+                return converge_once and len(taken) == 1
+
+        agent = _Bounded(
+            target="X", scale_keys=("sp1",), brain=None,
+            environment=_OneScaleVolume(), rng=np.random.default_rng(0),
+        )
+
+        with pytest.raises(NotFound) as raised:
+            agent.search(40)
+
+        assert "40 steps" in str(raised.value), (phase, str(raised.value))
+        assert agent._steps_left <= 0, phase
+        # Bounded, not merely finite. `_focus` checks AFTER stepping, so it may
+        # overrun by one step per offset; what must not happen is a loop that
+        # runs on past the budget indefinitely.
+        assert len(taken) <= 40 + 7, (phase, len(taken))
 
 
 # ---------------------------------------------------------------------------
@@ -1256,3 +1313,45 @@ def test_the_frankfort_horizontal_points_are_named():
         assert label in catalog.DESCRIPTIONS, label
     assert "porion" in catalog.DESCRIPTIONS["RPo"].lower()
     assert "orbitale" in catalog.DESCRIPTIONS["LOr"].lower()
+
+
+# ---------------------------------------------------------------------------
+# How many agents walk at once
+# ---------------------------------------------------------------------------
+
+def test_the_ask_is_capped_at_the_widest_width_worth_having():
+    """A run RESERVES what it is granted, so asking wider than the measured
+    knee takes room from other runs and gives this one nothing.
+
+    Measured on 119 landmarks: width 8 is 128.0 s and width 12 is 127.3 s, for
+    three more gigabytes of card. The cap is on the ASK -- the supervisor still
+    answers with less on a busy machine, and a request holding fewer landmarks
+    than the cap still asks only for those.
+    """
+    from sadt_ali_cbct import engine as cbct_engine
+
+    asked = []
+
+    class _Generous:
+        """A supervisor that grants whatever it is asked for."""
+
+        def channels(self, wanted):
+            asked.append(wanted)
+            return wanted
+
+    # 119 landmarks on a machine that would pay for all of them: still 8.
+    assert cbct_engine._channels_for(_Generous(), 119) == cbct_engine.MAX_AGENT_CHANNELS
+    assert asked == [cbct_engine.MAX_AGENT_CHANNELS], (
+        "the cap must narrow the ASK, not just the answer -- admission reserves "
+        "against what the tool asked for"
+    )
+
+    # Fewer landmarks than the cap: the count still decides.
+    assert cbct_engine._channels_for(_Generous(), 3) == 3
+
+    class _Stingy:
+        def channels(self, wanted):
+            return 2
+
+    # A busy machine still narrows it further; the cap is not a floor.
+    assert cbct_engine._channels_for(_Stingy(), 119) == 2

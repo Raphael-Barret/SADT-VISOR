@@ -27,6 +27,35 @@ VARIABLE = "SADT_PROGRESS_FILE"
 MAX_MESSAGE = 200
 PIPE_BUF = 4096
 
+# How many of its own items this tool is processing AT ONCE, right now. None
+# until something says otherwise, and a record without it is IGNORED by the
+# server rather than read as one -- which is what lets a tool declare a width
+# for the phase that HAS one and stay silent through the serial phases around
+# it. The server keeps the narrowest width it was told, and divides the run's
+# peak by it to learn what one channel costs; telling it nothing means the
+# whole peak is priced as a single channel, which over-reserves every run
+# afterwards and then narrows them.
+_width = None
+
+
+def set_width(width):
+    """Declare the width now in force, or None to stop declaring one.
+
+    A MEASUREMENT, not a permission: `sup.channels()` says what a run may
+    open, this says what it actually opened, and they are reported apart on
+    purpose. A tool has phases of different widths -- AMASSS reads its cohort
+    serially, predicts its structures side by side, then assembles serially --
+    and declaring the permission through the serial phases would put a wide
+    width in force where the peak actually happens, teaching a per-channel
+    cost that is too low. That is the direction that ends in an
+    out-of-memory.
+    """
+    global _width
+    try:
+        _width = None if width is None else max(1, int(width))
+    except (TypeError, ValueError):
+        _width = None
+
 
 def emit(fraction, message):
     """Append one progress event. Never raises; does nothing when unset.
@@ -42,9 +71,10 @@ def emit(fraction, message):
     try:
         if fraction is not None:
             fraction = round(min(1.0, max(0.0, float(fraction))), 4)
-        line = json.dumps(
-            {"fraction": fraction, "message": str(message)[:MAX_MESSAGE]}
-        ).encode("utf-8") + b"\n"
+        record = {"fraction": fraction, "message": str(message)[:MAX_MESSAGE]}
+        if _width is not None:
+            record["width"] = _width
+        line = json.dumps(record).encode("utf-8") + b"\n"
         if len(line) > PIPE_BUF:
             return  # a partial line would be unparsable; drop the event instead
         handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)

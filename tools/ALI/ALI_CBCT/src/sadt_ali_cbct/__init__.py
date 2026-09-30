@@ -93,15 +93,13 @@ def run(
         ]
     ] = [],
     device: Literal["cuda", "cpu"] = "cuda",
-    search_seconds: float = 0.0,
+    search_steps: int = 0,
     seed: int = 0,
+    num_workers: int = 0,
     *,
     data_root=None,
-    # Declared even though this engine calls nobody. A supervisor is what
-    # makes a tool's environment homogeneous: every served tool is entered the
-    # same way, a checkpoint can be declared here the day one is wanted, and
-    # the server stops having two shapes of tool to reason about. Unused is
-    # the point -- it costs a keyword and buys one contract instead of two.
+    # It calls no other tool, and it is no longer unused: `sup.channels()` is
+    # how this engine learns how many agents the machine will pay for at once.
     sup=None,
 ) -> Path:
     """Place anatomical landmarks on a CBCT scan.
@@ -126,16 +124,25 @@ def run(
             is what a client showing no region control relies on.
         device: "cuda" or "cpu". CUDA falls back to CPU when no card is
             visible, with a warning.
-        search_seconds: Seconds one agent may spend looking for its landmark
-            before it is reported as not found. 0 uses the default for the
-            device in use -- 15 s on CUDA, 60 s on CPU -- since there is no
-            nullable type in the schema to express "unset" with.
+        search_steps: Forward passes one agent may spend looking for its
+            landmark before it is reported as not found. 0 uses the engine's
+            default, since there is no nullable type in the schema to express
+            "unset" with. The same number on every device: a step is a forward
+            pass, so the bound no longer moves with the hardware or the load.
         seed: Seed the agents respawn from, so a run is reproducible. An agent
             that steps out of the volume restarts from a random position, and
             for a landmark at the edge of the field of view that position
             decides the answer -- so on the default the same scan gives the
             same landmarks every time, and changing it is how to see how stable
             a point actually is.
+        num_workers: How many landmarks to search at once. 0 lets the server
+            decide from the room it reserved for this run, which is the normal
+            case; a number is a ceiling on that, never a floor over it. One
+            agent holds its own networks on the card, so the budget clamps the
+            answer long before the request does. It cannot change a
+            coordinate: an agent's random stream is derived from its
+            landmark's name, so the answer never depends on which other
+            landmarks were asked for, nor in what order they ran.
 
     Returns:
         The output directory, holding the markups files and the run report.
@@ -158,7 +165,9 @@ def run(
         landmarks=landmarks,
         prediction_ID=PREDICTION_ID,
         device=device,
-        search_seconds=search_seconds,
+        search_steps=search_steps,
+        num_workers=num_workers,
+        sup=sup,
         seed=seed,
     )
     return output_dir

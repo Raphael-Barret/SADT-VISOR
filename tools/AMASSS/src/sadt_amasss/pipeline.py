@@ -19,6 +19,7 @@ What the move out of the server changed, beyond dropping `base`/`config`/
 See the comments marked "FIX:" for the original CLI's defects corrected here.
 """
 
+from concurrent import futures
 import json
 import logging
 import os
@@ -231,6 +232,51 @@ def _write_segmentation(array, reference, output_path: str) -> str:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _channels_for(sup, wanted: int, declared: int = 0) -> int:
+    """How many structures to predict at once: what the machine will pay for.
+
+    The tool asks for its own count -- the structures it was told to produce --
+    and the supervisor answers with what this run's reserved share can afford,
+    floor one. So a busy server narrows the run instead of refusing it, and a
+    machine with room runs the whole selection side by side.
+
+    **`declared` is `num_workers`, and declaring it is what turns any of this
+    on.** The server's `execution/concurrency` is inert for a tool whose schema
+    names neither `num_workers` nor `batch_size`: it reserves no room, sets no
+    `SADT_CHANNEL_BUDGET`, and `sup.channels()` then answers 1 before doing any
+    arithmetic at all. This tool asked for five structures and was answered one
+    every time for exactly that reason -- the parallel loop was right and never
+    got a width to use. The argument is in the server's `TECHNICAL` table, so
+    it is filled in for the clinician and never rendered on a panel.
+
+    A number the CALLER named is a ceiling on the ask, never a floor over it:
+    admission reserved against what it granted, and a tool that spread wider
+    than its own share would be spending memory nobody set aside.
+
+    One without a supervisor -- a CLI, a test -- unless the caller named a
+    number there, which is the only place a bare `num_workers` still decides:
+    nothing has reserved anything, and opening five nnUNet predictors on an
+    unknown card is a way to be killed rather than a way to be fast.
+    """
+    wanted = max(1, int(wanted))
+    try:
+        declared = int(declared or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > 0:
+        wanted = min(wanted, declared)
+
+    ask = getattr(sup, "channels", None)
+    if ask is None:
+        return max(1, wanted) if declared > 0 else 1
+    try:
+        return max(1, min(wanted, int(ask(wanted))))
+    except Exception:  # noqa: BLE001 - a grant must never fail a run
+        logger.warning("Could not ask for channels; predicting one at a time",
+                       exc_info=True)
+        return 1
+
+
 def segment(
     input_path: str,
     model_path: str,
@@ -244,6 +290,8 @@ def segment(
     device: str = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    num_workers: int = 0,
+    sup=None,
 ) -> dict:
     """Segment one scan or a batch under `output_dir`, and return the report."""
     started_at = time.monotonic()
@@ -308,6 +356,8 @@ def segment(
             tile_step_size=tile_step_size,
             gpu_resampling=gpu_resampling,
             started_at=started_at,
+            num_workers=num_workers,
+            sup=sup,
         )
     finally:
         # The intermediates are large -- one predicted volume per scan and per
@@ -328,7 +378,8 @@ def segment(
 
 def _run(scans, models, missing_structures, output_dir, work_dir, structures, merge,
          prediction_ID, generate_surface, surface_smoothing, surface_decimation,
-         device, tile_step_size, gpu_resampling, started_at) -> dict:
+         device, tile_step_size, gpu_resampling, started_at, num_workers=0,
+         sup=None) -> dict:
     """Everything between the argument checks and the report."""
     # Convert every scan once into the single folder nnUNet reads. Predicting
     # per structure over the whole folder loads each checkpoint once, instead
@@ -373,25 +424,62 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
         raise ToolInputError("None of the input scans could be read as a medical volume.")
 
     # --- Inference: one model load per structure --------------------------
+    #
+    # **The structures overlap, and that is where the time was.** One nnUNet
+    # call is a third inference and two thirds preprocessing: measured on this
+    # pipeline, `preprocess` is 29.2 s of a 62.8 s loop at 1.8 % of the card
+    # and exactly one core, so a run left the GPU idle 78 % of its own length.
+    # Structures are the honest axis for that: each is a separate model over
+    # the same read-only input folder, writing to a directory of its own, and
+    # nothing they share is mutable.
+    #
+    # THREADS, not processes. The work is torch, which releases the GIL inside
+    # its kernels, and `predict_from_files_sequential` runs in this process on
+    # purpose (see nnunet_runner) -- a process pool would need a CUDA context
+    # each and would lose the model sharing that pool exists for.
     predictions = {}
     failed_structures = {}
-    for structure_index, (code, model_folder) in enumerate(models.items(), start=1):
-        # Per STRUCTURE, which is the honest unit here: one nnUNet call covers
-        # the whole cohort, so there is no per-scan position to report inside
-        # it and interpolating one would invent a number the tool cannot know.
-        progress.report(structure_index, len(models), "structure", start=0.1, end=0.9)
+    width = _channels_for(sup, len(models), num_workers)
+    logger.info("Predicting %d structure(s) %d at a time on %s",
+                len(models), width, device)
+
+    def predict(item):
+        code, model_folder = item
         structure_output = os.path.join(work_dir, f"pred_{code}")
-        try:
-            logger.info("Predicting %s on %s", code, device)
-            nnunet_runner.predict_folder(
-                model_folder, nnunet_input, structure_output, device,
-                tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
-            )
-            predictions[code] = structure_output
-        except Exception as exc:
-            # One structure failing must not lose the others.
-            logger.exception("Prediction failed for structure %s", code)
-            failed_structures[code] = str(exc)
+        nnunet_runner.predict_folder(
+            model_folder, nnunet_input, structure_output, device,
+            tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
+        )
+        return code, structure_output
+
+    # Declared around THIS phase and nowhere else. The peak is here -- one
+    # nnUNet model resident per channel -- and the serial phases either side
+    # report no width at all, which the server ignores rather than reading as
+    # one. Without it the whole peak is priced as a single channel, and every
+    # run after this one is reserved for five channels' worth and then granted
+    # fewer of them.
+    progress.set_width(width)
+    done = 0
+    with futures.ThreadPoolExecutor(max_workers=width) as pool:
+        running = {pool.submit(predict, item): item[0] for item in models.items()}
+        for future in futures.as_completed(running):
+            code = running[future]
+            done += 1
+            # Reported on COMPLETION, not on submission: with a pool every
+            # structure starts at once, so a bar driven off starts would jump
+            # to full and then sit there for the length of the run.
+            progress.report(done, len(models), "structure", start=0.1, end=0.9)
+            try:
+                _code, structure_output = future.result()
+                predictions[code] = structure_output
+            except Exception as exc:
+                # One structure failing must not lose the others.
+                logger.exception("Prediction failed for structure %s", code)
+                failed_structures[code] = str(exc)
+    # Back to declaring nothing: what follows is one scan at a time again, and
+    # a width left standing over it would be the permission masquerading as a
+    # measurement.
+    progress.set_width(None)
 
     if not predictions:
         raise RuntimeError(
@@ -414,6 +502,11 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
                 generate_surface=generate_surface,
                 surface_smoothing=surface_smoothing,
                 surface_decimation=surface_decimation,
+                # The same share the structures were spread over. A run holds
+                # what admission reserved for it for its whole life, so using
+                # it again here spends nothing that was not already set aside
+                # -- and the card is idle throughout this phase.
+                workers=width,
             )
             record["status"] = "ok"
         except Exception as exc:
@@ -467,7 +560,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
 
 def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction_ID,
                            merge, generate_surface, surface_smoothing,
-                           surface_decimation) -> None:
+                           surface_decimation, workers: int = 1) -> None:
     """Turn one scan's per-structure nnUNet masks into its final files."""
     import numpy as np
     import SimpleITK as sitk
@@ -503,9 +596,6 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
 
     scan_dir = os.path.join(output_dir, f"{base}_{prediction_ID}_SegOut")
     os.makedirs(scan_dir, exist_ok=True)
-    surface_temp = os.path.join(work_dir, "surface_tmp")
-    os.makedirs(surface_temp, exist_ok=True)
-
     # Separate files: requested, or unavoidable when there is only one
     # structure (a "merged" volume of one structure is just that structure).
     if "SEPARATE" in merge or len(masks) == 1:
@@ -514,24 +604,23 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
             record["segmentations"].append(
                 _write_segmentation(mask, reference, output_path)
             )
-            if generate_surface:
-                record["surfaces"].append(
-                    vtk_export.write_separate_surface(
-                        mask=mask,
-                        reference=reference,
-                        # FIX: the code is passed explicitly instead of being
-                        # parsed back out of the file name (original KeyError).
-                        structure_code=code,
-                        label_colors=LABEL_COLORS,
-                        labels=LABELS,
-                        temp_dir=surface_temp,
-                        smoothing=surface_smoothing,
-                        decimation=surface_decimation,
-                        output_path=os.path.join(
-                            scan_dir, f"{base}_{prediction_ID}_{code}.vtk"
-                        ),
-                    )
+        if generate_surface:
+            # Every structure's mesh at once, and written out in the order
+            # `masks` holds them -- the run's own, so the file names and the
+            # report do not depend on which thread finished first.
+            record["surfaces"].extend(
+                vtk_export.write_separate_surfaces(
+                    masks=masks,
+                    reference=reference,
+                    label_colors=LABEL_COLORS,
+                    labels=LABELS,
+                    smoothing=surface_smoothing,
+                    decimation=surface_decimation,
+                    output_dir=scan_dir,
+                    name_of=lambda code: f"{base}_{prediction_ID}_{code}.vtk",
+                    workers=workers,
                 )
+            )
 
     if "MERGED" in merge and len(masks) > 1:
         shape = next(iter(masks.values())).shape
@@ -548,10 +637,10 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
                 reference=reference,
                 names_from_labels=NAMES_FROM_LABELS,
                 label_colors=LABEL_COLORS,
-                temp_dir=surface_temp,
                 smoothing=surface_smoothing,
                 decimation=surface_decimation,
                 output_path=os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED.vtk"),
+                workers=workers,
             )
             if surface:
                 record["surfaces"].append(surface)

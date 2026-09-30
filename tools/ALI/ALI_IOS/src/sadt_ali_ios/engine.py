@@ -26,6 +26,8 @@ import logging
 import os
 import time
 
+import numpy as np
+
 from .torch_helpers import import_torch, resolve_device
 from .errors import ToolInputError, ToolUnavailableError
 from sadt_ali_common.markups import MARKUPS_EXTENSION
@@ -198,16 +200,30 @@ def _predicted_faces(predictions, pix_to_face, channel: int) -> list:
     to int16 first, truncating every value toward zero, which turned near ties
     into exact ties that argmax then resolved in favour of the background
     channel -- shrinking every mask for no reason anyone intended.
+
+    **One gather, not one device round trip per predicted pixel.** The loop
+    this replaces called `.item()` on a card-resident tensor once per pixel the
+    mask claimed, and every one of those is a synchronisation: 3.46 s of a
+    21.6 s run (16.0 %) to read 119,456 integers that one indexing operation
+    reads at once. `nonzero` already returns its hits in row-major
+    (view, row, column) order, which is the order the loop visited them in, so
+    the list is identical element for element -- verified against the loop on
+    all 70 calls of a real run. That order is load-bearing: the caller sums
+    these faces' vertices sequentially in float32.
     """
     torch = import_torch()
 
     classes = torch.argmax(predictions, dim=1)
-    faces = []
-    for view_index, row, column in (classes == channel).nonzero(as_tuple=False):
-        face = int(pix_to_face[view_index, 0, row, column, 0].item())
-        if face >= 0:
-            faces.append(face)
-    return faces
+    hits = (classes == channel).nonzero(as_tuple=False)
+    if hits.numel() == 0:
+        return []
+    # `pix_to_face` is float32 here, not int64: it is accumulated into a tensor
+    # `torch.empty(0)` created, and cat promotes. `.long()` truncates toward
+    # zero exactly as the `int(...)` it replaces did, and a mesh would need
+    # 16.7M faces before float32 could not hold an index exactly.
+    picked = pix_to_face[hits[:, 0], 0, hits[:, 1], hits[:, 2], 0].long()
+    # A pixel where nothing was rendered carries -1 and is dropped.
+    return picked[picked >= 0].tolist()
 
 
 def _landmark_position(faces, face_table, vertices, locator, scaled_surface):
@@ -215,14 +231,49 @@ def _landmark_position(faces, face_table, vertices, locator, scaled_surface):
 
     Snapped onto an actual mesh point rather than left as the raw centroid,
     which would float inside the tooth: a landmark is a point *on* the crown.
-    """
-    vertex_ids = [
-        int(face_table[0][face][corner].item()) for face in faces for corner in range(3)
-    ]
-    if not vertex_ids:
-        return None
 
-    centroid = sum(vertices[0][vertex_id] for vertex_id in vertex_ids) / len(vertex_ids)
+    **The centroid is computed to the last bit of what the loop produced**, and
+    that constraint is what shapes this function. What it replaces read three
+    card-resident integers per face with `.item()`, then added the vertices one
+    tensor at a time -- so a mask of 1,622 faces cost 4,866 device
+    synchronisations and 4,866 kernel launches to add 4,866 rows of three
+    floats. Measured: 5.17 s of a 21.6 s run, the single most expensive thing
+    in the engine, and 24 % of it, against 1.6 % for the inference it exists to
+    interpret.
+
+    Two details make the vectorised form bit-identical rather than merely
+    close, and neither was arrived at by reasoning -- both are what measurement
+    forced, after a first version that looked obviously correct was not:
+
+    * **a sequential accumulation, and numpy's**, not `sum(dim=0)`. float32
+      addition is not associative, so a tree reduction is a different number
+      from adding the rows one after another -- about a ULP per thousand rows.
+      `torch.cumsum` is sequential on CUDA and NOT on the CPU, which this tool
+      also runs on, so it is right on the card and wrong in the test suite;
+      `np.add.accumulate`, which `np.cumsum` is, is sequential on both.
+      Verified against the loop at five sizes from 3 to 14,220 rows and on
+      every call of a real run, on both devices.
+    * **the division stays in torch, on the tensor's own device.** Moved to
+      numpy it came out one ULP different, because torch divides a tensor by a
+      scalar by multiplying by the reciprocal. That is a 6e-08 shift in
+      unit-sphere space -- 2 nanometres of patient, which would never have
+      moved the snapped point, and would still have made this function
+      something other than what it replaced.
+
+    So the total comes back to the device as three floats to be divided there.
+    Two 12-byte transfers, against the 4,866 synchronisations they replace.
+    """
+    torch = import_torch()
+
+    if not len(faces):
+        return None
+    wanted = torch.as_tensor(faces, dtype=torch.long, device=face_table.device)
+    # Face-major, corner-minor: the order the nested loop visited them in.
+    vertex_ids = face_table[0][wanted].reshape(-1)
+    gathered = vertices[0][vertex_ids]
+
+    total = np.cumsum(gathered.detach().cpu().numpy(), axis=0, dtype=np.float32)[-1]
+    centroid = torch.from_numpy(total).to(gathered.device) / vertex_ids.numel()
     point_id = locator.FindClosestPoint(centroid.detach().cpu().numpy())
     return scaled_surface.GetPoint(point_id)
 

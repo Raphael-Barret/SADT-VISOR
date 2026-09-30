@@ -204,19 +204,26 @@ class Agent:
         Whether the new position has been seen before is decided BEFORE it is
         remembered -- checking afterwards would compare the position against
         itself and report convergence on the very first step.
+
+        Counted here and nowhere else: a step is one forward pass, which is
+        97.8 % of what a search costs (measured on this engine: 15.16 ms of a
+        15.50 ms pass). So the budget below counts exactly the thing that takes
+        the time.
         """
+        self._steps_left -= 1
         self._move(self.brain.predict(self.scale_state, self._state()))
         circled = self._has_circled()
         self._remember()
         return circled
 
-    def _focus(self, start_position, deadline: float):
+    def _focus(self, start_position):
         """Average where the agent settles from six nearby starting points.
 
-        Bounded by the same deadline as the search itself. The original looped
-        `while not found` with nothing to stop it: an agent that respawns (which
-        clears the memory convergence is detected from) can circle forever, and
-        in a server worker thread that is a request that never returns.
+        Bounded by the same step budget as the search itself. The original
+        looped `while not found` with nothing to stop it: an agent that
+        respawns (which clears the memory convergence is detected from) can
+        circle forever, and in a server worker thread that is a request that
+        never returns.
         """
         limits = self.environment.size(self._current_scale()) - 1
         final = np.array([0.0, 0.0, 0.0])
@@ -229,22 +236,41 @@ class Agent:
             self._remember()
 
             while not self._step():
-                if time.monotonic() > deadline:
-                    raise NotFound("converged but timed out while refining the position")
+                if self._steps_left <= 0:
+                    raise NotFound(
+                        f"converged but ran out of steps while refining the "
+                        f"position ({self._step_budget} steps)"
+                    )
             final += self.position
 
         return final / len(_FOCUS_OFFSETS)
 
     # -- search ------------------------------------------------------------
 
-    def search(self, max_seconds: float):
+    def search(self, max_steps: int):
         """Walk until the landmark is found; return its voxel position.
 
-        Raises `NotFound` when the agent runs out of time or respawns too many
+        Raises `NotFound` when the agent runs out of STEPS or respawns too many
         times. Both are normal outcomes on a difficult scan, and the run report
         distinguishes them from a landmark whose weights were simply missing.
+
+        **Steps, not seconds, and that is the whole reason this engine can be
+        widened at all.** The bound was a per-agent wall clock, which made the
+        budget depend on how busy the machine was: two agents sharing one card
+        each advance at half the rate, so a budget that was generous alone
+        expires on a landmark that would have been found. It did not report
+        "I was interrupted" -- it reported "this landmark did not converge",
+        which is indistinguishable from a point legitimately outside a
+        truncated field of view. Measured: four agents wide dropped C4, and a
+        thread pool of six lost nine landmarks of twelve.
+
+        A step count is a property of the search and of nothing else. It does
+        not move with the width, the device or the load, and it is the same
+        number on a laptop and on this card -- which is why the cuda/cpu split
+        the seconds needed is gone.
         """
-        deadline = time.monotonic() + max_seconds
+        self._step_budget = max(1, int(max_steps))
+        self._steps_left = self._step_budget
 
         self.scale_state = 0
         self.speed = self.speed_per_scale[0]
@@ -254,9 +280,10 @@ class Agent:
 
         found = False
         while not found:
-            if time.monotonic() > deadline:
+            if self._steps_left <= 0:
                 raise NotFound(
-                    f"did not converge within {max_seconds:g}s (see search_seconds)"
+                    f"did not converge within {self._step_budget} steps "
+                    f"(see search_steps)"
                 )
 
             if self._step():
@@ -267,4 +294,4 @@ class Agent:
             if self.attempts >= _MAX_ATTEMPTS:
                 raise NotFound(f"left the volume {self.attempts} times without converging")
 
-        return self._focus(self.position, deadline)
+        return self._focus(self.position)
