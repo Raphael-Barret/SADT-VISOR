@@ -97,6 +97,38 @@ def _own_bundle(data_root, name):
     return candidate if os.path.isdir(candidate) else ""
 
 
+def derive_automation(automation: str, t1_root: str) -> tuple:
+    """The mode this request really is, read off the meshes it sends.
+
+    Returns `(mode, source)`, `source` being "from the data" or "requested".
+
+    IOS has two modes and the difference is written in the file: a
+    Semi-Automated registration takes crown-segmented meshes, a Fully-Automated
+    one labels them with Crown_Seg first. Asking the clinician meant the answer
+    could disagree with the folder, and when it did a run either relabelled
+    meshes that were already labelled or failed on meshes that were not.
+
+    Read off T1 alone. The two timepoints are one cohort of one patient group
+    and are labelled together or not at all; a T2 in a different state is a
+    mixed cohort, which `pipeline` already refuses by patient with a message
+    about the pair.
+
+    NOT read off `ios_reference`, unlike the CBCT engine's `reference`: this
+    deployment resolves its own orientation bundle (`_own_bundle`), so one is
+    always present and its presence says nothing about what the caller wants.
+    """
+    if automation and automation != catalogs.AUTOMATION_AUTO:
+        return automation, "requested"
+
+    # Imported here, not at module level: this pulls in vtk, and AREG_IOS is
+    # loaded on servers that answer for CBCT alone.
+    from . import surfaces
+
+    if surfaces.all_meshes_carry_labels(t1_root):
+        return catalogs.AUTOMATION_SEMI, "from the data"
+    return catalogs.AUTOMATION_FULLY, "from the data"
+
+
 def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, height,
                sup=None) -> None:
     if patch not in catalogs.PATCH_CHOICES:
@@ -373,9 +405,16 @@ def register(
     t1_root = _as_directory(t1_path, os.path.join(work_dir, "t1_input"))
     t2_root = _as_directory(t2_path, os.path.join(work_dir, "t2_input"))
 
+    # After extraction, because the answer is inside the meshes: a zip has to
+    # become a directory before anything can be read out of it.
+    automation, automation_source = derive_automation(automation, t1_root)
+
     report = {
         "modality": MODALITY,
         "automation": automation,
+        # Which of the two it was: "Semi-Automated" in a report does not say
+        # whether anybody chose it.
+        "automation_source": automation_source,
         "output_suffix": output_suffix,
         "patients": {},
     }
@@ -457,7 +496,20 @@ def main(
     registration_model = registration_model or _own_bundle(
         data_root, _REGISTRATION_BUNDLE)
     reference = ios_reference or _own_bundle(data_root, _ORIENTATION_REFERENCE)
-    _check_ios(automation, patch, registration_model, reference,
+    # The mode is read off the meshes, and the meshes are not extracted yet --
+    # so what is checked here is FULLY's requirements, which are the superset:
+    # everything Semi needs, plus Crown_Seg, ASO and an orientation reference.
+    # Checking the superset keeps the promise this function's docstring makes,
+    # that a request which cannot work comes back in a second rather than after
+    # an hour of registration.
+    #
+    # The one case it costs: a deployment WITHOUT Crown_Seg, handed meshes that
+    # are already labelled, is refused although Semi-Automated would have run.
+    # Naming 'Semi-Automated' in `automation` is the override for exactly that,
+    # and `tools.require` says so.
+    checked = (catalogs.AUTOMATION_FULLY
+               if automation in ("", catalogs.AUTOMATION_AUTO) else automation)
+    _check_ios(checked, patch, registration_model, reference,
                mgl_landmarks, mgl_patch_height, sup)
 
     run = register(

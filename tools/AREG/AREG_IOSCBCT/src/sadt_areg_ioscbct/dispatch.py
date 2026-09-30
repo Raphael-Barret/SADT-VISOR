@@ -274,13 +274,41 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         )
 
 
+def derive_automation(automation: str, ios_landmarks, cbct_landmarks,
+                     orient_cbct_first: bool = True) -> tuple:
+    """The mode this request really is. Returns `(mode, source)`.
+
+    `source` is "from the data" or "requested". See the note at the call site
+    for why only two of the three modes can be read off a folder.
+    """
+    if automation and automation != catalogs.AUTOMATION_AUTO:
+        return automation, "requested"
+    if ios_landmarks and cbct_landmarks:
+        return catalogs.AUTOMATION_REGISTRATION, "from the data"
+    return (catalogs.AUTOMATION_FULLY if orient_cbct_first
+            else catalogs.AUTOMATION_SEMI), "from the data"
+
+
 def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landmarks=None,
          cbct_reference=None, landmark_model=None, ios_landmark_model=None,
-         crown_model=None, max_dist=None, output_suffix="Reg", sup=None,
-         data_root=None):
+         crown_model=None, max_dist=None, output_suffix="Reg",
+         orient_cbct_first=True, sup=None, data_root=None):
     """Validate, fetch whatever the mode does not supply, then register."""
     started_at = time.monotonic()
-    automation = str(automation or catalogs.AUTOMATION_REGISTRATION)
+    # Two of the three modes are written in the request; the third is a choice.
+    #
+    # `Registration` is: both landmark sets supplied means predict nothing, there
+    # being nothing left to predict. What separates `Fully-Automated` from
+    # `Semi-Automated` is NOT in the data -- it is "orient the CBCT first", which
+    # nothing in a folder can answer -- so that one is asked as
+    # `orient_cbct_first`, a box that says what it does, instead of being hidden
+    # inside a three-valued mode nobody could map onto their own files.
+    #
+    # `cbct_reference` cannot stand in for it either: this deployment resolves
+    # its own (`_own_reference`), so one is always present.
+    automation, automation_source = derive_automation(
+        automation, ios_landmarks, cbct_landmarks, orient_cbct_first
+    )
     allowed = catalogs.AUTOMATION_BY_MODALITY[MODALITY]
     if automation not in allowed:
         raise ToolInputError(
@@ -299,6 +327,9 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
     report = {
         "modality": MODALITY,
         "automation": automation,
+        # Which of the two it was: a mode name in a report does not say whether
+        # anybody chose it.
+        "automation_source": automation_source,
         "output_suffix": suffix,
         "patients": {},
     }

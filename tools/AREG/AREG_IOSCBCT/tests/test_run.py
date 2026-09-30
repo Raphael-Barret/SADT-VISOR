@@ -198,11 +198,21 @@ def test_the_unpaired_patients_are_counted_in_the_log_not_named(tmp_path, caplog
 # The modes
 # ---------------------------------------------------------------------------
 
-def test_the_default_mode_is_the_one_that_needs_no_other_tool():
-    """A default that cannot run without a supervisor and three model bundles
-    reads as a broken tool rather than as a default."""
+def test_the_default_mode_names_no_mode_at_all():
+    """It used to be `Registration` -- the one that needs no other tool -- so a
+    default would not read as a broken tool. But a mode a caller DECLARES can
+    disagree with the folder they sent, and a request holding only scans was
+    then refused for missing the landmarks `Registration` requires.
+
+    The default now says "read it off the request", and naming a mode is an
+    override. See `catalogs.AUTOMATION_AUTO`."""
     assert inspect.signature(run).parameters["automation"].default == (
-        catalogs.AUTOMATION_REGISTRATION
+        catalogs.AUTOMATION_AUTO
+    )
+    assert catalogs.AUTOMATION_AUTO not in (
+        catalogs.AUTOMATION_REGISTRATION,
+        catalogs.AUTOMATION_SEMI,
+        catalogs.AUTOMATION_FULLY,
     )
 
 
@@ -212,12 +222,12 @@ def test_the_published_modes_are_the_catalog_s_own_for_this_modality():
     produces 422s; one `main` accepts and the signature omits is a mode no
     client can reach.
 
-    The ORDER differs on purpose -- the signature leads with the default, so
-    a client's picker opens on the mode that needs nothing."""
+    The ORDER differs on purpose -- the signature leads with the default, so a
+    client's picker opens on the value that asks nothing of the reader."""
     assert set(_choices("automation")) == set(
         catalogs.AUTOMATION_BY_MODALITY[catalogs.MODALITY_IOSCBCT]
     )
-    assert _choices("automation")[0] == catalogs.AUTOMATION_REGISTRATION
+    assert _choices("automation")[0] == catalogs.AUTOMATION_AUTO
 
 
 def test_the_oriented_mode_belongs_to_the_cbct_tool_alone(tmp_path):
@@ -240,11 +250,58 @@ def test_an_unknown_mode_names_the_value_and_what_is_offered(tmp_path):
         assert mode in message
 
 
-def test_an_omitted_mode_falls_back_to_registration(tmp_path):
+def test_an_omitted_mode_is_read_off_the_request(tmp_path):
     """`main` is also called directly by tests and by another tool, where the
-    signature's default does not apply."""
-    with pytest.raises(ToolInputError, match="Registration mode takes"):
+    signature's default does not apply -- so `None` has to mean the same thing
+    the default means.
+
+    It used to fall back to `Registration`, which then refused a request holding
+    only scans for missing the landmarks it requires. A request holding only
+    scans is now what it looks like: one with everything still to predict."""
+    assert dispatch.derive_automation(None, None, None) == (
+        catalogs.AUTOMATION_FULLY, "from the data"
+    )
+    with pytest.raises(ToolInputError) as raised:
         _main(tmp_path, automation=None)
+    assert "Registration mode takes" not in str(raised.value)
+
+
+def test_both_landmark_sets_mean_there_is_nothing_left_to_predict():
+    mode, source = dispatch.derive_automation(None, "/ios/lm", "/cbct/lm")
+
+    assert mode == catalogs.AUTOMATION_REGISTRATION
+    assert source == "from the data"
+
+
+def test_one_landmark_set_alone_is_not_registration_mode():
+    """Half of the pair is not a smaller answer, it is no answer: the
+    cross-modality registration needs points on both sides."""
+    assert dispatch.derive_automation(None, "/ios/lm", None)[0] != (
+        catalogs.AUTOMATION_REGISTRATION
+    )
+    assert dispatch.derive_automation(None, None, "/cbct/lm")[0] != (
+        catalogs.AUTOMATION_REGISTRATION
+    )
+
+
+def test_orienting_the_cbct_first_is_what_separates_the_two_predicted_modes():
+    """The one thing here no folder can answer, so it is asked as itself rather
+    than hidden inside a three-valued mode."""
+    assert dispatch.derive_automation(None, None, None, orient_cbct_first=True)[0] == (
+        catalogs.AUTOMATION_FULLY
+    )
+    assert dispatch.derive_automation(None, None, None, orient_cbct_first=False)[0] == (
+        catalogs.AUTOMATION_SEMI
+    )
+
+
+def test_a_named_mode_overrides_what_the_request_looks_like():
+    mode, source = dispatch.derive_automation(
+        catalogs.AUTOMATION_SEMI, "/ios/lm", "/cbct/lm"
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+    assert source == "requested"
 
 
 # ---------------------------------------------------------------------------
@@ -380,17 +437,47 @@ def test_every_layout_condition_names_a_mode_this_tool_has():
 
 def test_the_landmark_folders_are_hidden_in_the_modes_that_overwrite_them():
     """Showing them in a mode that predicts its own is how a user comes to
-    believe their files were used."""
+    believe their files were used.
+
+    The auto value is in the condition beside Registration, and has to be: it is
+    the default now, and filling these folders is HOW Registration is selected.
+    A condition naming Registration alone would have hidden the two fields that
+    select Registration."""
     for argument in ("ios_landmarks", "cbct_landmarks"):
-        assert LAYOUT[argument]["visible_when"] == {
-            "automation": catalogs.AUTOMATION_REGISTRATION
-        }
+        shown_in = LAYOUT[argument]["visible_when"]["automation"]
+        assert catalogs.AUTOMATION_REGISTRATION in shown_in
+        assert catalogs.AUTOMATION_AUTO in shown_in
+        assert catalogs.AUTOMATION_SEMI not in shown_in
+        assert catalogs.AUTOMATION_FULLY not in shown_in
 
 
 def test_the_orientation_reference_is_shown_only_in_the_mode_that_orients():
-    assert LAYOUT["cbct_reference"]["visible_when"] == {
-        "automation": catalogs.AUTOMATION_FULLY
-    }
+    shown_in = LAYOUT["cbct_reference"]["visible_when"]["automation"]
+
+    assert catalogs.AUTOMATION_FULLY in shown_in
+    assert catalogs.AUTOMATION_AUTO in shown_in
+    assert catalogs.AUTOMATION_REGISTRATION not in shown_in
+
+
+def test_the_one_choice_no_folder_can_answer_is_asked_as_itself():
+    """`orient_cbct_first` replaces what used to be the difference between two
+    values of `automation`. A three-valued mode was the wrong shape: two of its
+    values were facts about the files, the third was a preference."""
+    # The label names the FRAME: "orient first" said what the tool does, not
+    # what the reader gets, and a clinician cannot act on the difference.
+    label = LAYOUT["orient_cbct_first"]["label"]
+    assert "Frankfurt" in label
+    # Spelled like the bundle and like the rest of the repository, never the
+    # anatomical "Frankfort" -- a panel and a folder differing by a letter is a
+    # support question.
+    assert "Frankfort" not in label
+    assert not LAYOUT["orient_cbct_first"].get("hidden")
+    shown_in = LAYOUT["orient_cbct_first"]["visible_when"]["automation"]
+    assert catalogs.AUTOMATION_REGISTRATION not in shown_in
+
+
+def test_the_mode_itself_is_not_put_to_the_reader():
+    assert LAYOUT["automation"]["hidden"] is True
 
 
 def test_every_published_argument_has_a_label(tmp_path):

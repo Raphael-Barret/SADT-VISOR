@@ -34,9 +34,16 @@ def run(
     t1: Path,
     t2: Path,
     output_dir: Path,
+    # "From the data" is the default and names no mode: `dispatch.derive_automation`
+    # reads it off what the request supplies -- masks are Semi-Automated, none is
+    # Fully-Automated, and the frame named in `orientation` below chooses the
+    # oriented variant.
+    # Naming one of the three is an override and still obeyed. Spelled out because
+    # `Literal` takes literals only; a test asserts it against `catalogs`.
     automation: Literal[
-        "Semi-Automated", "Fully-Automated", "Oriented + Fully-Automated"
-    ] = "Fully-Automated",
+        "From the data",
+        "Semi-Automated", "Fully-Automated", "Oriented + Fully-Automated",
+    ] = "From the data",
     # Spelled out because `Literal` takes literals only -- it cannot be built
     # from catalogs.REGION_CHOICES. That makes this a second declaration of the
     # same set, which is the thing this contract otherwise avoids, so a test
@@ -60,6 +67,20 @@ def run(
     reference: Path = "",
     landmark_model: Path = "",
     dicom_input: bool = False,
+    # WHICH FRAME the scans come back in, and the one thing about the automated
+    # path that no folder can answer. Naming a frame is what asks for the T1 to
+    # be oriented first; "Leave as scanned" is the default and asks for nothing.
+    #
+    # Two frames rather than a yes/no, because the two published bundles carry
+    # disjoint landmark sets and mean different things -- Frankfurt horizontal
+    # for the cranial base, the occlusal plane for the occlusion. A boolean here
+    # could only have said "the default one", which is the defect this replaced.
+    #
+    # Read only when no `t1_masks` are sent: with masks in hand there is nothing
+    # to segment and nothing to orient for.
+    orientation: Literal[
+        "Leave as scanned", "Frankfurt horizontal", "Occlusal plane"
+    ] = "Leave as scanned",
     output_suffix: str = "Reg",
     *,
     sup=None,
@@ -73,8 +94,12 @@ def run(
         t2: The follow-up scans, paired to T1 by patient key.
         output_dir: Where the registered scans, their transforms and
             `AREG_report.json` are written. Nothing is written outside it.
-        automation: Semi-Automated takes your own masks; Fully-Automated
-            segments them; Oriented + Fully-Automated orients both timepoints
+        automation: Left on its default the mode is read off the request --
+            masks mean Semi-Automated, none means Fully-Automated, and
+            the frame named in `orientation` picks the oriented variant.
+            Naming a mode
+            overrides that: Semi-Automated takes your own masks, Fully-Automated
+            segments them, Oriented + Fully-Automated orients both timepoints
             first, which needs a reference.
         regions: The anatomy to register on -- what has NOT changed between the
             timepoints. The one argument a clinician must actually think about.
@@ -93,7 +118,17 @@ def run(
         reference: The frame the scans are oriented onto before registering.
         landmark_model: The landmark bundle that orientation step predicts
             with.
-        dicom_input: The inputs are DICOM series rather than volumes.
+        dicom_input: The inputs are DICOM series rather than volumes. Detected
+            from the data when left off; this forces the conversion.
+        orientation: The anatomical frame the scans are returned in. "Leave as
+            scanned" keeps the scanner's own frame and skips the orientation
+            step; naming a frame orients the T1 onto that reference first, which
+            costs a landmark prediction per patient. The two are not
+            interchangeable: Frankfurt horizontal is defined by
+            Ba, S, N, RPo, LPo, ROr and LOr, the occlusal plane by
+            ANS, IF, PNS, UL6O, UR1O and UR6O, so the measurement made
+            afterwards does not say the same thing. Read only when no masks are
+            supplied.
         output_suffix: Added to each output name, e.g. `scan_Reg.nii.gz`.
 
     Returns:
@@ -114,6 +149,7 @@ def run(
         cbct_reference=reference,
         landmark_model=landmark_model,
         dicom_input=dicom_input,
+        orientation=orientation,
         output_suffix=output_suffix,
         sup=sup,
         data_root=data_root,

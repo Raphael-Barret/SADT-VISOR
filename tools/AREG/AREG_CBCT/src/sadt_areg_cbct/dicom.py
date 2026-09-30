@@ -36,6 +36,36 @@ _INSTALL_HINT = (
 )
 
 
+def holds_a_series(root: str) -> bool:
+    """True when anything under `root` is a readable DICOM series.
+
+    Asked rather than declared. DICOM slices routinely carry no extension at
+    all, so a clinician could not tell from a file name either -- which is why
+    the panel used to put the question to them, and why the answer being wrong
+    was a run that failed for a reason nobody could see. ASO's CBCT engine
+    detects it this way and ALI's always has; this is the same question asked
+    in the same words.
+
+    AREG's own copy rather than an import of ASO's, for the reason this
+    module's docstring already gives about `convert_tree`: importing another
+    tool's module at load time makes one tool's missing dependency take both
+    out of the registry.
+
+    Stops at the first series found: a cohort of forty patients does not need
+    forty answers to a yes/no question.
+    """
+    reader = sitk.ImageSeriesReader()
+    for directory, _subdirs, _names in os.walk(root):
+        try:
+            if reader.GetGDCMSeriesFileNames(directory):
+                return True
+        except RuntimeError:
+            # GDCM raises on a directory it cannot even scan. That is "no
+            # series here", not a failure of the run.
+            continue
+    return False
+
+
 def convert_tree(input_root: str, output_root: str) -> str:
     """Convert every DICOM series under `input_root` into `output_root`.
 

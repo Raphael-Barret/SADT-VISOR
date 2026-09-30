@@ -110,6 +110,37 @@ def label_array_name(surface: vtk.vtkPolyData) -> str:
     return None
 
 
+def all_meshes_carry_labels(root: str) -> bool:
+    """True when every mesh under `root` already carries its tooth labels.
+
+    Which is the question `automation` used to put to the clinician: a
+    Semi-Automated IOS registration takes crown-segmented meshes, a
+    Fully-Automated one labels them with Crown_Seg first. The answer is written
+    in the file, in one of `LABEL_ARRAY_NAMES` -- so asking meant the answer
+    could disagree with the folder, and when it did a run either relabelled
+    meshes that were already labelled or failed on meshes that were not.
+
+    EVERY mesh, and short-circuiting on the first that has none: labelling is
+    done for the whole folder or not at all, so one unlabelled mesh in forty
+    makes the cohort one to label. `False` is also the answer for a folder with
+    no mesh in it -- there is nothing here that is ready, and the caller gets
+    the refusal that names the real problem a step later.
+    """
+    found = False
+    for directory, _subdirs, names in os.walk(root or ""):
+        for name in sorted(names):
+            if name.startswith(".") or not is_surface_file(name):
+                continue
+            found = True
+            try:
+                if label_array_name(read_surface(os.path.join(directory, name))) is None:
+                    return False
+            except SurfaceError:
+                # A mesh that cannot be read is not a mesh that is ready.
+                return False
+    return found
+
+
 def jaw_of(filename: str) -> str:
     """'Upper', 'Lower', or None when the name does not say.
 

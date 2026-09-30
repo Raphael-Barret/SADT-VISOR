@@ -20,7 +20,13 @@ _MGL = {"patch": catalogs.PATCH_MGL}
 _PREDICTED = {"patch": [p for p in catalogs.PATCH_CHOICES if p != catalogs.PATCH_MGL]}
 # Only the fully-automated mode labels and orients the meshes itself; the
 # semi-automated one takes meshes that already carry both.
-_FULLY = {"automation": catalogs.AUTOMATION_FULLY}
+#
+# `AUTOMATION_AUTO` is in it because that is now the DEFAULT value of
+# `automation`: a condition naming only Fully-Automated matches nothing on a
+# request nobody has overridden. Both fields it guards happen to be `hidden`
+# today, so nothing is visibly wrong either way -- which is exactly why it is
+# written down, rather than left as a trap for the next field added here.
+_FULLY = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_FULLY]}
 
 LAYOUT = {
     # Injected by the server for every tool that calls another (see
@@ -49,7 +55,22 @@ LAYOUT = {
     # no way to tell which was which. The engines keep this label when opened
     # directly, where there is only one dropdown and no ambiguity, so the word
     # has to carry its own meaning either way.
-    "automation": {"section": _INPUTS, "label": "Automation"},
+    # Read off the meshes (see dispatch.derive_automation): ones that already
+    # carry their tooth labels are Semi-Automated, ones that do not are
+    # Fully-Automated. Asking the clinician meant the answer could disagree with
+    # the folder, and when it did a run either relabelled meshes that were
+    # already labelled or failed on meshes that were not.
+    #
+    # Still an argument, as the override it can express -- and the one case that
+    # needs it: a deployment without Crown_Seg, handed labelled meshes, has to
+    # name 'Semi-Automated' because the door-check tests FULLY's requirements
+    # while the mode is still unknown (see dispatch.main).
+    #
+    # Hidden here as well as in the other two engines: the facade publishes ONE
+    # `automation` and takes its presentation from whichever engine composes
+    # first, so a hint left in one place would depend on the order of a dict in
+    # deployment.toml.
+    "automation": {"section": _INPUTS, "label": "Automation", "hidden": True},
 
     "patch": {"section": _REGISTRATION, "label": "Registration patch"},
     # `ios_reference`, NOT `reference`: AREG_CBCT publishes a `reference` that is

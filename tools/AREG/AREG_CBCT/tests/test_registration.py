@@ -373,3 +373,185 @@ def test_a_single_file_input_becomes_a_folder_of_its_own(tmp_path):
         t2_path=str(both / "P1_T2_scan.nii.gz"),
     )
     assert run.succeeded == ["P1"]
+
+
+# ---------------------------------------------------------------------------
+# The mode, read off the request
+# ---------------------------------------------------------------------------
+# `automation` used to be a dropdown a clinician had to set, and setting it
+# wrong was silent: Fully-Automated over a folder of masks segmented again,
+# Semi-Automated over scans with none failed patient by patient. Each of the
+# three modes is identified by an INPUT, so the question never needed asking.
+# ASO closed the same hole first, for landmarks.
+
+
+def test_masks_make_it_semi_automated():
+    mode, source = dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, "/somewhere/masks", None
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+    assert source == "from the data"
+
+
+def test_no_masks_makes_it_fully_automated():
+    mode, source = dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None)
+
+    assert mode == catalogs.AUTOMATION_FULLY
+    assert source == "from the data"
+
+
+@pytest.mark.parametrize("frame", [
+    catalogs.ORIENTATION_FRANKFURT, catalogs.ORIENTATION_OCCLUSAL,
+])
+def test_naming_a_frame_is_what_picks_the_oriented_variant(frame):
+    """The one thing here no folder can answer, so it is asked by NAME.
+
+    Both frames select the oriented mode: they differ in WHERE the scans end up,
+    not in whether they are oriented."""
+    mode, source = dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None, frame)
+
+    assert mode == catalogs.AUTOMATION_ORIENTED
+    assert source == "from the data"
+
+
+def test_leaving_the_scans_as_they_came_is_fully_automated():
+    assert dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, None, catalogs.ORIENTATION_NONE
+    )[0] == catalogs.AUTOMATION_FULLY
+    # And the same for a caller that sends nothing at all, `main` being callable
+    # directly, where the signature's default does not apply.
+    assert dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None, None)[0] == (
+        catalogs.AUTOMATION_FULLY
+    )
+
+
+def test_masks_win_over_asking_for_an_orientation():
+    """With masks in hand there is nothing to segment and nothing to orient
+    for, so the frame is not read."""
+    mode, _source = dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, "/somewhere/masks", catalogs.ORIENTATION_FRANKFURT
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+
+
+def test_each_frame_resolves_to_its_own_bundle(tmp_path):
+    """A reference defines its frame through what it CARRIES, so naming the
+    frame is naming the bundle -- and the two carry disjoint landmark sets, which
+    is why one cannot stand in for the other."""
+    models = tmp_path / "AREG" / "models"
+    for bundle in catalogs.ORIENTATION_BUNDLES.values():
+        (models / bundle).mkdir(parents=True)
+
+    for frame, bundle in catalogs.ORIENTATION_BUNDLES.items():
+        assert dispatch._own_reference(str(tmp_path), frame) == str(models / bundle)
+
+    # The frame that is no frame resolves to nothing, rather than to the first
+    # bundle it finds.
+    assert dispatch._own_reference(str(tmp_path), catalogs.ORIENTATION_NONE) == ""
+
+
+def test_the_orientation_reference_is_never_a_mode_signal():
+    """Measured through the server on 2026-09-29, after 113 unit tests had
+    passed on the opposite assumption.
+
+    `reference` carries `server_selectable = "model"`, so the server fills it
+    from `DATA/AREG/models/` whenever the client leaves it empty -- it is never
+    absent. Reading it as "the caller asked for an orientation" refused every
+    run that sent masks, for a reference nobody had named.
+
+    Asserted on the SIGNATURE, because that is what makes the mistake
+    impossible to make again: there is nowhere to pass it.
+    """
+    import inspect
+
+    assert list(inspect.signature(dispatch.derive_automation).parameters) == [
+        "automation", "t1_masks", "orientation",
+    ]
+
+
+@pytest.mark.parametrize("named", [
+    catalogs.AUTOMATION_SEMI, catalogs.AUTOMATION_FULLY, catalogs.AUTOMATION_ORIENTED,
+])
+def test_a_named_mode_overrides_the_data(named):
+    """The one thing naming a mode still does, and a legitimate thing to want:
+    "Fully-Automated" beside a folder of masks means "segment anyway, I know
+    they are there"."""
+    mode, source = dispatch.derive_automation(named, "/somewhere/masks")
+
+    assert mode == named
+    assert source == "requested"
+
+
+def test_the_report_says_whether_anybody_chose_the_mode(tmp_path):
+    """"Semi-Automated" in a report does not say whether it was asked for."""
+    cohort(tmp_path)
+    run = semi(tmp_path, automation=catalogs.AUTOMATION_AUTO)
+
+    assert run.report["automation"] == catalogs.AUTOMATION_SEMI
+    assert run.report["automation_source"] == "from the data"
+
+
+# ---------------------------------------------------------------------------
+# The orientation reference the deployment answers with
+# ---------------------------------------------------------------------------
+# `reference` is `server_selectable = "model"`, so a request that names no
+# bundle arrives holding `DATA/AREG/models/` -- the FOLDER, eight bundles deep,
+# which ASO cannot orient onto. The field is hidden and the tool answers.
+
+
+def test_a_deployment_without_the_bundle_says_nothing_rather_than_guessing(tmp_path):
+    """Returns "" so the single refusal in `_check_cbct` keeps saying what is
+    missing, instead of handing ASO a path that is not there."""
+    (tmp_path / "AREG" / "models").mkdir(parents=True)
+
+    assert dispatch._own_reference(
+        str(tmp_path), catalogs.ORIENTATION_FRANKFURT
+    ) == ""
+
+
+def test_the_models_folder_is_not_mistaken_for_a_bundle(tmp_path):
+    """The whole point: `main` has to tell "the caller named a bundle" from
+    "the server filled this in with the folder holding all of them".
+
+    Asserted through `main`, because the discrimination lives there -- and a run
+    that got the folder died inside ASO, minutes in, on a path that looks
+    perfectly valid.
+    """
+    data_root = tmp_path / "data"
+    frame = catalogs.ORIENTATION_FRANKFURT
+    bundle = (data_root / "AREG" / "models"
+              / catalogs.ORIENTATION_BUNDLES[frame])
+    bundle.mkdir(parents=True)
+    cohort(tmp_path)
+
+    with pytest.raises(Exception):  # noqa: B017 - no supervisor, so ASO is absent
+        dispatch.main(
+            automation=catalogs.AUTOMATION_ORIENTED,
+            t1=os.path.join(str(tmp_path), "T1"),
+            t2=os.path.join(str(tmp_path), "T2"),
+            cbct_regions=["Cranial base"],
+            cbct_reference=os.path.join(str(data_root), "AREG", "models"),
+            output_dir=os.path.join(str(tmp_path), "out"),
+            data_root=str(data_root),
+        )
+    # What matters is that the refusal is about the missing ASO tool, not about
+    # a reference -- the folder was replaced by the bundle before the check.
+    assert dispatch._own_reference(str(data_root), frame) == str(bundle)
+
+
+def test_the_orientation_reference_is_not_put_to_the_reader():
+    from sadt_areg_cbct.layout import LAYOUT
+
+    assert LAYOUT["reference"]["hidden"] is True
+
+
+def test_register_on_reads_like_the_amasss_lists():
+    """Three lists of anatomy in one panel should read alike."""
+    from sadt_areg_cbct.layout import LAYOUT
+
+    assert LAYOUT["regions"]["ui"] == "chips"
+    assert LAYOUT["segmentations"]["ui"] == "chips"
+    # And each chip says which folder its transforms come back in.
+    assert LAYOUT["regions"]["option_help"]["Cranial base"] == "CB"

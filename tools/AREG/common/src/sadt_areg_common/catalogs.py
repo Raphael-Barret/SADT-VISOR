@@ -31,13 +31,31 @@ AUTOMATION_ORIENTED = "Oriented + Fully-Automated"
 # Registration" beside it.
 AUTOMATION_REGISTRATION = "Registration"
 
-# Fully-Automated is the default rather than the Slicer module's
-# Or_Auto_CBCT: the oriented mode additionally needs an orientation reference
-# bundle, and a default that cannot run without a file the user has not chosen
-# yet reads as a broken tool rather than as a default.
+# The default, and it names no mode: each engine reads the mode off what the
+# request supplies -- masks, a reference, landmarks -- and this says "do that".
+#
+# It exists because a mode a caller DECLARES can disagree with the folder they
+# sent, and when it did the disagreement was silent, which is the lesson ASO
+# wrote down first: a fully-automated run over landmarks already on disk
+# predicted them again, a semi-automated one over scans with none failed patient
+# by patient. AREG had the same hole, with masks in place of landmarks.
+#
+# Named rather than empty, because it is published: a caller reading the schema
+# sees a value that says what it does, and a report that prints it is readable.
+# An explicit mode beside it is an OVERRIDE and still obeyed -- "segment anyway,
+# I know the masks are there" is a legitimate thing to want, and is now the only
+# thing naming a mode does.
+AUTOMATION_AUTO = "From the data"
+
+# Nothing pre-ticked but the auto value. Fully-Automated used to be the default,
+# chosen over the Slicer module's Or_Auto_CBCT because the oriented mode needs a
+# reference bundle the user has not picked yet -- but a default that names a mode
+# also made "Fully-Automated" indistinguishable from "nobody touched the menu",
+# so the override could not be told from the default. See AUTOMATION_AUTO.
 AUTOMATION_CHOICES = {
+    AUTOMATION_AUTO: True,
     AUTOMATION_SEMI: False,
-    AUTOMATION_FULLY: True,
+    AUTOMATION_FULLY: False,
     AUTOMATION_ORIENTED: False,
     AUTOMATION_REGISTRATION: False,
 }
@@ -46,14 +64,18 @@ AUTOMATION_CHOICES = {
 # "this option only exists for that modality" -- `visible_when` hides an
 # argument, not one option of a choice -- so the pair is checked in
 # AREGLogic.main and answered with a 422 naming what is available.
+# `AUTOMATION_AUTO` is in every one of them: every modality can read its mode
+# off the data, and the engines differ only in what they read.
 AUTOMATION_BY_MODALITY = {
-    MODALITY_CBCT: (AUTOMATION_SEMI, AUTOMATION_FULLY, AUTOMATION_ORIENTED),
-    MODALITY_IOS: (AUTOMATION_SEMI, AUTOMATION_FULLY),
+    MODALITY_CBCT: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY,
+                    AUTOMATION_ORIENTED),
+    MODALITY_IOS: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY),
     # No "Oriented + Fully-Automated" here: orienting before registering is a
     # CBCT step, and there is nothing to orient an intraoral scan onto in this
     # mode. Its third value is Registration instead -- landmarks in, no
     # prediction at all.
-    MODALITY_IOSCBCT: (AUTOMATION_SEMI, AUTOMATION_FULLY, AUTOMATION_REGISTRATION),
+    MODALITY_IOSCBCT: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY,
+                       AUTOMATION_REGISTRATION),
 }
 
 
@@ -106,6 +128,66 @@ SEGMENTATION_CODES = {
 # airway on every patient would add minutes of GPU and gigabytes of output to
 # a run nobody asked to segment.
 SEGMENTATION_CHOICES = {name: False for name in SEGMENTATION_CODES}
+
+# The same grouping AMASSS publishes, in AMASSS's own order, so the two panels
+# read alike: a clinician who ticks structures in AMASSS and then in AREG is
+# looking at one list, not two spellings of it.
+#
+# Restated rather than imported, for the reason AREG's own copy of the DICOM
+# conversion gives: importing another tool's module at load time makes one
+# tool's missing dependency take BOTH out of the registry, and the two live in
+# different virtualenvs. `SEGMENTATION_CODES` above already restates the same
+# table; this adds only the headings.
+#
+# AMASSS's third group, "Masks", is deliberately absent. Those are the volumes
+# the registration is confined to, this tool asks AMASSS for them itself
+# (`REGION_MASK_STRUCTURES`), and offering them here would let a clinician tick
+# a mask as though it were something to look at.
+SEGMENTATION_GROUPS = {
+    "Bones": ["Mandible", "Maxilla", "Cranial base", "Cervical vertebra"],
+    "Soft tissue": ["Upper airway", "Skin"],
+}
+
+# ---------------------------------------------------------------------------
+# The frame a CBCT is oriented into before registering
+# ---------------------------------------------------------------------------
+# Two published bundles, two different definitions of "straight", and the choice
+# is clinical rather than technical: they carry DISJOINT landmark sets --
+# Frankfurt Horizontal + Midsagittal has Ba/S/N/RPo/LPo/ROr/LOr, Occlusal +
+# Midsagittal has ANS/IF/PNS/UL6O/UR1O/UR6O (see ASO's `choose_reference`, and
+# `AREG_Method/CBCT.py:622-630` in the extension this was ported from). Someone
+# studying the cranial base and someone studying the occlusion do not want the
+# same one, and the measurement made afterwards does not say the same thing.
+#
+# This replaced a boolean, `orient_t1_first`, which was a two-valued control over
+# a three-valued question -- the same defect as the three-valued `automation` it
+# was introduced to fix, where two values were facts and one was a preference.
+#
+# Spelled "Frankfurt" rather than the anatomical "Frankfort" because that is what
+# the published bundle is called and what the rest of this repository says: a
+# panel and a folder disagreeing by a letter is a support question.
+ORIENTATION_NONE = "Leave as scanned"
+ORIENTATION_FRANKFURT = "Frankfurt horizontal"
+ORIENTATION_OCCLUSAL = "Occlusal plane"
+
+# Nothing by default: orienting costs an ASO chain and a landmark prediction per
+# patient, and a registration that nobody asked to reorient should come back in
+# the frame it arrived in.
+ORIENTATION_CHOICES = {
+    ORIENTATION_NONE: True,
+    ORIENTATION_FRANKFURT: False,
+    ORIENTATION_OCCLUSAL: False,
+}
+
+# The bundle each frame is defined BY -- a reference defines its frame through
+# what it carries, so naming the bundle is naming the frame. These are the names
+# `scripts/data-manifest.yml` unpacks the two archives to under
+# DATA/AREG/models/.
+ORIENTATION_BUNDLES = {
+    ORIENTATION_FRANKFURT: "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+    ORIENTATION_OCCLUSAL: "CBCT_Gold_Occlusal_Midsagittal_Plane",
+}
+
 
 # Tokens that name a region inside a mask's file name, matched as WHOLE tokens
 # of the stem rather than as substrings.

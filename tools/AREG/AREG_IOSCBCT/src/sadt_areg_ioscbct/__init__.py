@@ -43,9 +43,13 @@ def run(
     ios: Path,
     cbct: Path,
     output_dir: Path,
+    # "From the data" is the default and names no mode: `dispatch.derive_automation`
+    # reads it off the request -- both landmark sets supplied is Registration,
+    # which predicts nothing. Whether to orient the CBCT first is `orient_cbct_first`
+    # below, because no folder can answer it. Naming a mode is an override.
     automation: Literal[
-        "Registration", "Semi-Automated", "Fully-Automated"
-    ] = "Registration",
+        "From the data", "Registration", "Semi-Automated", "Fully-Automated"
+    ] = "From the data",
     ios_landmarks: Path = "",
     cbct_landmarks: Path = "",
     cbct_reference: Path = "",
@@ -53,6 +57,15 @@ def run(
     ios_landmark_model: Path = "",
     crown_model: Path = "",
     max_dist: float = 0.0,
+    # The one thing about this mode that a folder cannot answer, asked as what it
+    # is instead of hidden inside a three-valued `automation`: orienting the CBCT
+    # into a standard frame before the cross-modality registration is a clinical
+    # decision, not a property of the files. On by default -- it is what
+    # "Fully-Automated" did, and the frame the rest of the chain expects.
+    #
+    # Read only when no landmarks are supplied: with both sets in hand there is
+    # nothing to predict and nothing to orient for.
+    orient_cbct_first: bool = True,
     output_suffix: str = "Reg",
     *,
     sup=None,
@@ -83,6 +96,12 @@ def run(
         max_dist: How far a point may be from its nearest neighbour and still
             count as an ICP correspondence, in millimetres. 0 uses 1.5, which is
             upstream's.
+        orient_cbct_first: Put the CBCT in the Frankfurt horizontal and
+            mid-sagittal frame before the cross-modality registration. One frame
+            only, unlike the CBCT-to-CBCT engine which offers two: the landmarks
+            the rest of this chain reads are defined in this one, so another
+            would silently change what they mean. Read only when no landmarks
+            are supplied, there being nothing to orient for once they are.
         output_suffix: Added to each output name, e.g. `scan_Reg.vtk`.
 
     Returns:
@@ -94,7 +113,8 @@ def run(
         ios_landmarks=ios_landmarks, cbct_landmarks=cbct_landmarks,
         cbct_reference=cbct_reference, landmark_model=landmark_model,
         ios_landmark_model=ios_landmark_model, crown_model=crown_model,
-        max_dist=max_dist, output_suffix=output_suffix, sup=sup,
+        max_dist=max_dist, output_suffix=output_suffix,
+        orient_cbct_first=orient_cbct_first, sup=sup,
         data_root=data_root,
     )
     return output_dir

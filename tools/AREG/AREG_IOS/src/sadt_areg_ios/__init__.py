@@ -24,7 +24,13 @@ def run(
     t1: Path,
     t2: Path,
     output_dir: Path,
-    automation: Literal["Semi-Automated", "Fully-Automated"] = "Fully-Automated",
+    # "From the data" is the default and names no mode: `dispatch.derive_automation`
+    # reads it off the meshes -- ones that already carry their tooth labels are
+    # Semi-Automated, ones that do not are Fully-Automated. Naming either is an
+    # override and still obeyed.
+    automation: Literal[
+        "From the data", "Semi-Automated", "Fully-Automated"
+    ] = "From the data",
     ios_reference: Path = "",
     patch: Literal[
         "Palate (upper arch)", "Mucogingival line (lower arch)"

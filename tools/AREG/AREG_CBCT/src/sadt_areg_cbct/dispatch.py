@@ -82,6 +82,9 @@ class RegistrationRun:
 # without anybody choosing anything.
 _DATA_NAME = "AREG"
 _SEGMENTATION_BUNDLE = "AMASSS_Models"
+# Which bundle each frame is defined by lives in the shared catalog
+# (`catalogs.ORIENTATION_BUNDLES`), because the panel offers the frame by name
+# and this resolves the name -- one table, read from both ends.
 
 
 def _own_segmentation(data_root):
@@ -100,6 +103,70 @@ def _own_segmentation(data_root):
         return ""
     candidate = os.path.join(str(data_root), _DATA_NAME, "models", _SEGMENTATION_BUNDLE)
     return candidate if os.path.isdir(candidate) else ""
+
+
+def _own_reference(data_root, orientation: str) -> str:
+    """The bundle this deployment publishes for the frame `orientation` names.
+
+    A reference defines its frame through what it CARRIES -- the two published
+    bundles hold disjoint landmark sets -- so naming the frame is naming the
+    bundle, and this is the whole of the translation.
+
+    Two reasons the path is resolved here rather than asked for. `reference`
+    carries `server_selectable = "model"`, so a request that names nothing
+    arrives holding `DATA/AREG/models/`: the FOLDER, eight bundles deep, which
+    ASO cannot orient onto. And a dropdown of bundle FOLDERS asks a clinician to
+    recognise `CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane` where the
+    question is "Frankfurt horizontal or occlusal plane".
+
+    Returns "" for the frame that is no frame, and for a deployment that does
+    not publish the bundle -- the refusal in `_check_cbct` then keeps saying what
+    is missing.
+    """
+    bundle = catalogs.ORIENTATION_BUNDLES.get(str(orientation or ""))
+    if not data_root or not bundle:
+        return ""
+    candidate = os.path.join(str(data_root), _DATA_NAME, "models", bundle)
+    return candidate if os.path.isdir(candidate) else ""
+
+
+def derive_automation(automation: str, t1_masks,
+                     orientation: str = catalogs.ORIENTATION_NONE) -> tuple:
+    """The mode this request really is. Returns `(mode, source)`.
+
+    `source` is "from the data" or "requested".
+
+    One of the three modes is written in the request and the other two differ by
+    a preference:
+
+    * `t1_masks` -- masks the caller made -- is Semi-Automated. There is nothing
+      else to do with them, and asking anyway meant a Fully-Automated run could
+      segment over a folder of masks somebody had prepared;
+    * with none, AMASSS makes them, and what is left to decide is WHICH FRAME the
+      scans come back in. No folder answers that -- there are two published
+      frames and they mean different things -- so it is asked as `orientation`,
+      by name, rather than hidden inside a three-valued mode or behind a boolean
+      that could only say "the default one".
+
+    **The orientation `reference` is deliberately NOT read here**, though it is
+    what the oriented mode needs. It carries `server_selectable = "model"`, so
+    the server fills it from `DATA/AREG/models/` whenever the client leaves it
+    empty -- it is never absent, and a run sending masks was refused for
+    "sending both" on a reference nobody had named. Measured through the server
+    on 2026-09-29, after 113 unit tests had passed on the assumption.
+
+    A named mode overrides all of it, and that is the one thing naming a mode
+    still does: "Fully-Automated" beside a folder of masks means "segment anyway,
+    I know they are there".
+    """
+    if automation and automation != catalogs.AUTOMATION_AUTO:
+        return automation, "requested"
+    if t1_masks:
+        return catalogs.AUTOMATION_SEMI, "from the data"
+    chose_a_frame = (str(orientation or catalogs.ORIENTATION_NONE)
+                     != catalogs.ORIENTATION_NONE)
+    return (catalogs.AUTOMATION_ORIENTED if chose_a_frame
+            else catalogs.AUTOMATION_FULLY), "from the data"
 
 
 def _check_cbct(automation: str, regions: list, t1_masks, reference,
@@ -208,8 +275,19 @@ def _run_cbct(
 
     elastix.check_dependencies()
 
-    if dicom_input:
+    # Asked of the DATA, not of the caller, the way ASO's CBCT engine asks it.
+    # DICOM slices routinely carry no extension, so a clinician could not tell
+    # from a file name either -- and answering wrong produced a run that failed
+    # for a reason nobody could see. `dicom_input` remains an OVERRIDE for a
+    # caller who knows better than the detector, which is why it stays in the
+    # signature and leaves the panel.
+    #
+    # The two timepoints are asked separately: a cohort half exported as DICOM
+    # and half already converted is somebody's real Tuesday, and one flag for
+    # both would have made them choose which half to break.
+    if dicom_input or dicom.holds_a_series(t1_root):
         t1_root = dicom.convert_tree(t1_root, os.path.join(work_dir, "dicom_t1"))
+    if dicom_input or dicom.holds_a_series(t2_root):
         t2_root = dicom.convert_tree(t2_root, os.path.join(work_dir, "dicom_t2"))
 
     # Descended ONCE, here, before anything reads either folder: a hosted test
@@ -405,6 +483,7 @@ def register(
     orientation_reference: str = None,
     landmark_model: str = None,
     dicom_input: bool = False,
+    orientation: str = catalogs.ORIENTATION_NONE,
     output_suffix: str = "Reg",
     output_dir: str = None,
     sup=None,
@@ -423,9 +502,18 @@ def register(
     t1_root = _as_directory(t1_path, os.path.join(work_dir, "t1_input"))
     t2_root = _as_directory(t2_path, os.path.join(work_dir, "t2_input"))
 
+    # Resolved here, in the real API, so a direct caller gets the same rule the
+    # schema adapter gets. Idempotent: a named mode passes through unchanged.
+    automation, automation_source = derive_automation(
+        automation, t1_masks_path, orientation
+    )
+
     report = {
         "modality": MODALITY,
         "automation": automation,
+        # Which of the two it was, because "Semi-Automated" in a report does not
+        # say whether anybody chose it.
+        "automation_source": automation_source,
         "output_suffix": output_suffix,
         "patients": {},
     }
@@ -472,6 +560,7 @@ def main(
     cbct_reference=None,
     landmark_model=None,
     dicom_input=False,
+    orientation=None,
     output_suffix="Reg",
     output_dir=None,
     sup=None,
@@ -503,8 +592,21 @@ def main(
     # actually be loaded rather than what the caller happened to name.
     if not segmentation_model:
         segmentation_model = _own_segmentation(data_root)
+    # Same treatment, and the hidden field makes it the only one: a `reference`
+    # nobody named arrives as the whole models FOLDER (see `_own_reference`), so
+    # "did the caller name one" is asked of the bundle, not of the string.
+    # A `reference` nobody named arrives as the whole models FOLDER (see
+    # `_own_reference`), so "did the caller name a bundle" is asked of the
+    # bundle, not of the string -- and the frame the panel offered answers it.
+    if not reference or os.path.basename(str(reference).rstrip(os.sep)) == "models":
+        reference = _own_reference(data_root, orientation) or reference
+    # The checks judge the mode that will RUN, not the word the request carried:
+    # with `automation` left on its default, that word names no mode. `register`
+    # derives it again from the same inputs, so the rule lives in one place and
+    # the report says which of the two it was.
+    resolved, _source = derive_automation(automation, t1_masks, orientation)
     _check_cbct(
-        automation, regions, t1_masks, reference, segmentation_model, sup,
+        resolved, regions, t1_masks, reference, segmentation_model, sup,
         landmark_model,
     )
 
@@ -519,6 +621,7 @@ def main(
         orientation_reference=str(reference) if reference else None,
         landmark_model=landmark_model,
         dicom_input=bool(dicom_input),
+        orientation=orientation,
         output_suffix=suffix,
         output_dir=output_dir,
         sup=sup,

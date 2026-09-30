@@ -3,16 +3,41 @@
 from sadt_areg_common import catalogs
 
 _INPUTS = "Inputs"
-_LANDMARKS = "Landmarks"
+# "Advanced", not "Landmarks", and the name does two things at once.
+#
+# It is what the section IS: landmarks a caller already has are the escape hatch
+# from predicting them, which is the same role ASO's landmark folder plays and
+# the reason ASO puts it under this name. The client folds a section called
+# "Advanced" shut by default (base_widget._COLLAPSED_SECTIONS), so someone who
+# does not have landmarks no longer steps over two file pickers on the way to
+# Apply.
+#
+# And it fixes where the box SITS. `formgen.sections_of` orders sections by
+# first mention in the schema, and the facade composes AREG_CBCT first -- so a
+# section only this engine named was first mentioned after AREG_CBCT's
+# "Outputs", and the panel showed Landmarks BELOW the output folder. Under this
+# name it merges into the Advanced box AREG_CBCT already declares, which comes
+# before Outputs.
+_LANDMARKS = "Advanced"
 _MODELS = "Models"
 _OUTPUTS = "Outputs"
 
 # Registration takes the landmarks; the other two predict them. Showing the
 # landmark folders in a mode that overwrites them is how a user comes to believe
 # their files were used.
-_SUPPLIED = {"automation": catalogs.AUTOMATION_REGISTRATION}
-_PREDICTED = {"automation": [catalogs.AUTOMATION_SEMI, catalogs.AUTOMATION_FULLY]}
-_ORIENTED = {"automation": catalogs.AUTOMATION_FULLY}
+#
+# `AUTOMATION_AUTO` is in all three because it is now the DEFAULT value of
+# `automation`, which names no mode: a condition listing only the named modes
+# would match nothing on a request nobody has overridden, and every field it
+# guards would vanish -- including the landmark folders, which are how
+# Registration mode is SELECTED. In the auto case the reader sees the superset
+# and picks a mode by filling a field; someone who overrides sees only what
+# their mode reads.
+_SUPPLIED = {"automation": [catalogs.AUTOMATION_AUTO,
+                            catalogs.AUTOMATION_REGISTRATION]}
+_PREDICTED = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_SEMI,
+                             catalogs.AUTOMATION_FULLY]}
+_ORIENTED = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_FULLY]}
 
 LAYOUT = {
     # Injected by the server for every tool that calls another (see
@@ -41,7 +66,38 @@ LAYOUT = {
     # no way to tell which was which. The engines keep this label when opened
     # directly, where there is only one dropdown and no ambiguity, so the word
     # has to carry its own meaning either way.
-    "automation": {"section": _INPUTS, "label": "Automation"},
+    # Read off the request (see dispatch.derive_automation): both landmark sets
+    # supplied is Registration, which predicts nothing. Still an argument, as an
+    # override.
+    #
+    # What it CANNOT derive is the difference between the other two -- orienting
+    # the CBCT first is a clinical decision, not a property of a folder -- so
+    # that is asked below as `orient_cbct_first`, a box that says what it does.
+    # A three-valued mode was the wrong shape for it: two of its values were
+    # facts about the files and the third was a preference.
+    #
+    # Hidden here as well as in the other two engines: the facade publishes ONE
+    # `automation` and takes its presentation from whichever engine composes
+    # first, so a hint left in one place would depend on the order of a dict in
+    # deployment.toml.
+    "automation": {"section": _INPUTS, "label": "Automation", "hidden": True},
+    # The one choice this mode really has. Visible, and only where it is read:
+    # with both landmark sets in hand there is nothing to predict and nothing to
+    # orient for.
+    # The label names the frame, because "orient first" said what the tool does
+    # and not what the reader gets. Spelled "Frankfurt" like the bundle and like
+    # the rest of this repository, not the anatomical "Frankfort": a panel and a
+    # folder disagreeing by a letter is a support question.
+    #
+    # A yes/no here, unlike AREG_CBCT's `orientation`, and that difference is the
+    # point: there only ONE frame is valid in this mode, the landmarks the rest
+    # of the chain reads being defined in it, so offering the occlusal plane
+    # would offer a way to be silently wrong.
+    "orient_cbct_first": {
+        "section": _INPUTS,
+        "label": "Standardise the CBCT orientation (Frankfurt)",
+        "visible_when": _PREDICTED,
+    },
 
     "ios_landmarks": {
         "section": _LANDMARKS, "label": "Intraoral landmarks", "visible_when": _SUPPLIED,
