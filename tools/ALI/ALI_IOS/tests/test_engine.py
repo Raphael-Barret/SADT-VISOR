@@ -648,3 +648,90 @@ def test_the_resolved_device_is_what_the_checkpoints_are_loaded_onto(tmp_path, s
 
     identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"], device="cuda")
     assert {device for _path, device, _code in stubs.loaded} == {"cpu"}
+
+
+# ---------------------------------------------------------------------------
+# Projecting a mask back onto the mesh, and the order it is done in
+# ---------------------------------------------------------------------------
+
+def test_a_predicted_mask_is_read_in_row_major_order_with_nothing_rendered_dropped():
+    """`_predicted_faces` walks (view, row, column) in that order, and a pixel
+    where nothing was rendered is dropped rather than selecting the last face.
+
+    Both halves are pinned because both were lost once. The original passed
+    `-1` on, where `faces[-1]` silently selected the mesh's last face and
+    dragged the centroid to a corner of the arch; and the order is what the
+    caller's sequential float32 sum depends on.
+    """
+    # Two views, two classes, 1x2 pixels. Class 1 wins everywhere except the
+    # last pixel, so three pixels are claimed, in reading order.
+    predictions = torch.tensor(
+        [
+            [[[0.0, 0.0]], [[1.0, 1.0]]],   # view 0: both pixels class 1
+            [[[0.0, 1.0]], [[1.0, 0.0]]],   # view 1: first class 1, second class 0
+        ]
+    )
+    # float32 on purpose: this is what the tensor the views are accumulated
+    # into actually holds, `torch.cat` having promoted int64 to float.
+    pix_to_face = torch.tensor(
+        [
+            [[[[70.0], [-1.0]]]],           # view 0: face 70, then nothing
+            [[[[42.0], [99.0]]]],           # view 1: face 42, then face 99
+        ]
+    )
+
+    # View 0 pixel 0 -> 70, view 0 pixel 1 -> dropped, view 1 pixel 0 -> 42.
+    assert engine._predicted_faces(predictions, pix_to_face, 1) == [70, 42]
+    # Class 0 wins only at view 1 pixel 1.
+    assert engine._predicted_faces(predictions, pix_to_face, 0) == [99]
+    assert engine._predicted_faces(predictions, pix_to_face, 2) == []
+
+
+class _RecordingLocator:
+    """A point locator that keeps the centroid it was asked about."""
+
+    def __init__(self):
+        self.asked = []
+
+    def FindClosestPoint(self, point):
+        self.asked.append(point)
+        return 0
+
+
+class _OnePointSurface:
+    def GetPoint(self, point_id):
+        return (0.0, 0.0, 0.0)
+
+
+def test_the_centroid_is_accumulated_in_order_rather_than_as_a_tree():
+    """A landmark is the mesh point nearest the centroid of the faces a mask
+    claimed, and that centroid must be the number the original loop produced.
+
+    float32 addition is not associative, so `sum(dim=0)` -- a tree reduction --
+    is a DIFFERENT number from adding the rows one after another, by around a
+    ULP per thousand rows. It is a small number, and it is a number that decides
+    which of two adjacent vertices a landmark lands on. This pins the scan:
+    swap `cumsum(dim=0)[-1]` for `sum(dim=0)` and this test fails.
+    """
+    torch.manual_seed(0)
+    # Coordinates of the size the engine works in: the mesh is scaled into the
+    # unit sphere before anything is rendered.
+    vertices = ((torch.rand(4000, 3) - 0.5) * 2.0).unsqueeze(0)
+    face_table = torch.arange(3999).reshape(-1, 3).unsqueeze(0)
+    faces = list(range(face_table.shape[1]))
+
+    locator = _RecordingLocator()
+    engine._landmark_position(faces, face_table, vertices, locator, _OnePointSurface())
+
+    vertex_ids = [int(face_table[0][face][corner]) for face in faces for corner in range(3)]
+    sequential = sum(vertices[0][vertex_id] for vertex_id in vertex_ids) / len(vertex_ids)
+    assert locator.asked[0].tobytes() == sequential.numpy().tobytes()
+
+
+def test_a_mask_that_claimed_no_face_has_no_position():
+    """An empty list, not an exception and not the origin: the caller reads
+    `None` as "this landmark was not found on this tooth"."""
+    assert engine._landmark_position(
+        [], torch.zeros(1, 1, 3, dtype=torch.int64), torch.zeros(1, 3, 3),
+        _RecordingLocator(), _OnePointSurface()
+    ) is None

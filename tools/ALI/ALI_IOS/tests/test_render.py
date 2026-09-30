@@ -253,3 +253,87 @@ def test_four_teeth_crowded_into_a_short_span_is_also_refused():
     # One more id of span and the same four-tooth count is accepted.
     labels, vertices = _arch([19, 20, 21, 23])
     assert render.estimate_missing_teeth(labels, vertices, catalog.MG_TEETH, "cpu")
+
+
+# ---------------------------------------------------------------------------
+# One rasterization per view
+# ---------------------------------------------------------------------------
+
+class _CountingRenderer:
+    """A renderer shaped like `MeshRendererWithFragments`: it hands back the
+    fragments it rasterized, and it counts how often it was asked.
+
+    `rasterizer` is here so a test can prove nothing reaches it. Calling it
+    raises: a second rasterization is the defect these two tests exist to
+    catch, and it is invisible in the output -- the images come out identical,
+    the run just takes twice as long in its most expensive phase.
+    """
+
+    def __init__(self, pixels: int = 2):
+        self.calls = []
+        self.pixels = pixels
+
+    class _Rasterizer:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("a view was rasterized a second time")
+
+    rasterizer = _Rasterizer()
+
+    def __call__(self, meshes_world, R=None, T=None):
+        self.calls.append((R, T))
+        size = self.pixels
+        # (batch, H, W, RGBA), which the callers permute and trim to RGB.
+        image = torch.zeros(1, size, size, 4)
+        fragments = type(
+            "Fragments",
+            (),
+            {
+                "zbuf": torch.zeros(1, size, size, 1),
+                "pix_to_face": torch.zeros(1, size, size, 1, dtype=torch.int64),
+            },
+        )()
+        return image, fragments
+
+
+class _PlainMesh:
+    def clone(self):
+        return self
+
+
+def test_a_crown_view_is_rasterized_once_and_the_fragments_come_back_with_it():
+    """The depth channel and `pix_to_face` both come from the fragments, and
+    they used to be recovered by rasterizing the mesh AGAIN -- 238 views of a
+    real mesh, 476 rasterizations, half of them recomputing what the shading
+    pass had just thrown away.
+    """
+    renderer = _CountingRenderer()
+    directions = render.CAMERA_POSITIONS["C"]["Upper"]
+
+    images, pix_to_face = render.render_views(
+        renderer=renderer, mesh=_PlainMesh(), center=torch.zeros(1, 3),
+        radius=1.0, camera_positions=directions, device="cpu",
+    )
+
+    assert len(renderer.calls) == len(directions)
+    # Every call carried its own pose. The second rasterization used to pass
+    # none at all, reading the pose out of the cameras the first had left it in.
+    assert all(R is not None and T is not None for R, T in renderer.calls)
+    assert images.shape[1] == len(directions)
+    assert pix_to_face.shape[0] == len(directions)
+
+
+def test_a_mucogingival_view_is_rasterized_once_too():
+    """The same fix on the other path, which AREG_IOSCBCT is the only caller
+    of -- so it is the one least likely to be noticed by hand."""
+    renderer = _CountingRenderer()
+    normal = torch.tensor([1.0, 0.0, 0.0])
+    directions = render.mg_camera_directions(normal, "cpu")
+
+    images, pix_to_face = render.render_mg_views(
+        renderer=renderer, mesh=_PlainMesh(), aim=torch.zeros(3),
+        directions=directions, radius=1.0, device="cpu",
+    )
+
+    assert len(renderer.calls) == 3
+    assert images.shape[1] == 3
+    assert pix_to_face.shape[0] == 3

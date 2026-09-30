@@ -166,3 +166,28 @@ def test_nothing_is_written_beside_the_mesh_it_read(tmp_path, monkeypatch):
 
     assert sorted(os.listdir(workspace)) == before
     assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_faces_on_tooth_hands_its_faces_back_in_the_order_it_was_given(tmp_path):
+    """The order is load-bearing, not tidiness.
+
+    `_landmark_position` sums these faces' vertices one after another, and
+    float32 addition is not associative -- so reordering the list moves the
+    centroid in its last bits, and a centroid is snapped to the nearest mesh
+    point. This pins the property that survived vectorising the filter: the
+    faces come back in the order they went in, minus the ones that do not touch
+    this tooth.
+    """
+    mesh = surface.read_surface(
+        write_surface(tmp_path / "arch.vtk", labels=(8, 8, 8, 9, 9, 9))
+    )
+    scaled, _center, _factor = surface.scale_to_unit(mesh)
+    _vertices, faces, _colors, labels = surface.surface_properties(scaled, "cpu")
+
+    # Shuffled, and with one face repeated: a mask projects the same face once
+    # per pixel that predicted it, and those duplicates are part of the sum.
+    asked = [3, 0, 1, 0, 2]
+    kept = surface.faces_on_tooth(faces, asked, labels, 8)
+
+    assert kept == [face for face in asked if face in kept]
+    assert kept.count(0) == 2
