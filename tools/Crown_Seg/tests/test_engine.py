@@ -472,3 +472,65 @@ def test_fdi_numbering_writes_fdi_values_under_the_requested_name(sphere, tmp_pa
         return vtk_to_numpy(reader.GetOutput().GetPointData().GetScalars(name))
 
     assert np.array_equal(labels(fdi, "FDI_ID"), engine.FDI_LUT[labels(universal, "Universal_ID")])
+
+
+# ---------------------------------------------------------------------------
+# Against pytorch3d, when it is installed
+# ---------------------------------------------------------------------------
+
+def test_the_views_are_the_ones_pytorch3d_renders_the_pole_camera_included(sphere):
+    """One camera of the rig sits so close to the `up` axis that
+    `look_at_rotation` returns a rotation that is not orthonormal (an axis of
+    norm 0.02). pytorch3d INVERTS that matrix to cast its rays, where a
+    transpose would assume it orthonormal; the two agree on the other 41
+    cameras and disagree on this one, which pytorch3d renders as a strip a few
+    pixels wide and a transpose renders as a full view. The strip is what
+    shapeaxi's network was trained and run on, so it is what is reproduced."""
+    pytest.importorskip("pytorch3d")
+    from pytorch3d.renderer import (
+        AmbientLights, FoVPerspectiveCameras, HardPhongShader, MeshRasterizer,
+        MeshRenderer, RasterizationSettings, TexturesVertex,
+    )
+    from pytorch3d.structures import Meshes
+
+    _surf, verts, faces, colors = engine.load_surface(sphere)
+    rig = engine.camera_rig()
+    ours, ours_pix = engine.render_views(verts, faces, colors, rig, image_size=SMALL)
+
+    cameras = FoVPerspectiveCameras()
+    renderer = MeshRenderer(
+        rasterizer=MeshRasterizer(cameras=cameras, raster_settings=RasterizationSettings(
+            image_size=SMALL, blur_radius=0, faces_per_pixel=1)),
+        shader=HardPhongShader(cameras=cameras, lights=AmbientLights()),
+    )
+    meshes = Meshes(verts=verts[None], faces=faces[None], textures=TexturesVertex(verts_features=colors[None]))
+    different = []
+    for index, position in enumerate(rig):
+        rotation, translation = engine.camera_pose(position[None])
+        renderer(meshes_world=meshes.clone(), R=rotation, T=translation)
+        theirs = renderer.rasterizer(meshes.clone()).pix_to_face[0, :, :, 0]
+        # Edge pixels where both rasterizers hit a neighbouring face are the
+        # only disagreement expected (a handful of 4096); a whole view that
+        # differs is the pole camera rendered as a full view instead of a strip.
+        wrong = int((theirs != ours_pix[index]).sum())
+        if wrong > 0.002 * SMALL * SMALL:
+            different.append((index, wrong))
+
+    assert different == []
+
+
+def test_an_orthonormal_rotation_is_left_alone_and_the_pole_camera_becomes_a_strip(sphere):
+    """No pytorch3d needed: the 41 well-behaved cameras keep the matrix they
+    had, bit for bit, and the one near-degenerate camera is a narrow strip."""
+    _surf, verts, faces, colors = engine.load_surface(sphere)
+    rig = engine.camera_rig()
+    _views, pix_to_face = engine.render_views(verts, faces, colors, rig, image_size=SMALL)
+
+    coverage = (pix_to_face >= 0).float().mean(dim=(1, 2))
+    strips = [index for index, value in enumerate(coverage.tolist()) if value < 0.05]
+    assert strips == [4]
+
+    for index, position in enumerate(rig):
+        rotation, _translation = engine.camera_pose(position[None])
+        if index != 4:
+            assert torch.equal(engine.ray_rotation(rotation), rotation)

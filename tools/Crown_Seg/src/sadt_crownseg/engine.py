@@ -195,6 +195,25 @@ def camera_pose(position):
     return rotation, translation
 
 
+def ray_rotation(rotation):
+    """The rotation `render_native` must be given so that it casts pytorch3d's rays.
+
+    pytorch3d turns a view-space ray into a world ray with the INVERSE of `R`;
+    `render_native` uses its transpose, which is the same thing for an
+    orthonormal matrix. One camera of the rig is the exception: it sits so near
+    the `up` axis that `look_at_rotation` returns a matrix with an axis of norm
+    0.02, and the transpose then renders a full view where pytorch3d renders a
+    strip a few pixels wide (measured: 36 000 pixels differ on that one view).
+    The strip is what shapeaxi's network sees, so it is reproduced: for a
+    non-orthonormal matrix the transpose of the inverse is passed instead, and an
+    orthonormal one is returned untouched, so the other cameras do not move.
+    """
+    wide = rotation.double()
+    if torch.allclose(wide @ wide.transpose(1, 2), torch.eye(3, dtype=torch.float64), atol=1e-4):
+        return rotation
+    return torch.linalg.inv(wide).transpose(1, 2).to(rotation.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Input
 # ---------------------------------------------------------------------------
@@ -236,7 +255,7 @@ def render_views(verts, faces, colors, rig, image_size=None):
     images, hits = [], []
     for position in rig:
         rotation, translation = camera_pose(position.unsqueeze(0))
-        rgba, fragments = renderer(meshes_world=mesh, R=rotation, T=translation)
+        rgba, fragments = renderer(meshes_world=mesh, R=ray_rotation(rotation), T=translation)
         images.append(torch.cat([rgba[0, :, :, 0:3], fragments.zbuf[0]], dim=-1).permute(2, 0, 1))
         hits.append(fragments.pix_to_face[0, :, :, 0])
     return torch.stack(images), torch.stack(hits)
