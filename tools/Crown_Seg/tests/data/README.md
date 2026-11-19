@@ -1,7 +1,7 @@
 # Test data
 
 Nothing is committed here. The CI suite builds its own three-triangle meshes
-with VTK and stubs `_run_shapeaxi`, so input discovery, the already-segmented
+with VTK and stubs `_run_engine`, so input discovery, the already-segmented
 bypass, the output tree and the run report are all exercised without a
 checkpoint, a GPU, or the `segmentation` extra.
 
@@ -31,7 +31,7 @@ the real-model test does.
 turns the default selection off so `-m models` can select them:
 
 ```bash
-uv sync --extra segmentation     # a prebuilt pytorch3d wheel, see README.md
+uv sync --extra segmentation     # monai and embreex
 SADT_CROWNSEG_MODEL=/path/to/DATA/CrownSeg/models/07-21-22_val-loss0.169.pth \
 SADT_CROWNSEG_MESH=/path/to/DATA/CrownSeg/testfiles/T1_01_U_segmented.vtk \
 uv run pytest -m models -o addopts=

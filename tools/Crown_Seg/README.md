@@ -7,231 +7,100 @@ which is why this is its own tool.
 
 ## Provenance
 
-Not ported: written against `shapeaxi` directly. The Slicer modules ran the
-`dentalmodelseg` executable out of Slicer's own bin directory, and that
-executable is only the console-script entry point of the `shapeaxi` PyPI package
-(`dentalmodelseg = shapeaxi.dental_model_seg:cml`). There is no Slicer binary to
-shell out to here, so `shapeaxi.dental_model_seg.main` is called directly with
-the namespace its own `cml()` would have built.
+The method, the camera rig, the network and the weights are shapeaxi's
+`dentalmodelseg` (DCBIA-OrthoLab, <https://github.com/DCBIA-OrthoLab/ShapeAXI>),
+which the Slicer modules ran as an executable. This tool no longer calls
+shapeaxi: it imports pytorch3d, which has no Windows wheel and no Metal kernel,
+and its import chain pulls in lightning, ocnn, h5py, scikit-learn, torchvision,
+nibabel and itk for two small classes. `engine.py` carries the same pipeline on
+**torch, monai, VTK and Embree** and nothing else.
+
+| Part | Source |
+|---|---|
+| surface reading, unit scaling, normals, island removal, closing, FDI table | shapeaxi's own functions, extracted by AST into `_shapeaxi.py` (two marked edits) |
+| 42 cameras, 320x320, 60 degree field of view, white background, normals plus depth, per-face probability sum, per-vertex write | shapeaxi's `DentalModelSeg` and `prediction`, re-expressed in `engine.py` |
+| ray casting and shading | `render_native.py`, the renderer ALI_IOS and AREG_IOS already ship (a byte-identical copy, kept so by `scripts/tests/test_vendored_copies.py`) |
+| the idea of vendoring the pipeline, and the white-background finding | the lab's `iosseg` package, whose VTK and Open3D renderer is Eduardo Caleme's |
 
 Carried over from `slicer-remote-tool-server`'s `tools/CrownSeg/`, whose history
-this repository holds -- `git log --follow` on `src/sadt_crownseg/pipeline.py`
+this repository holds; `git log --follow` on `src/sadt_crownseg/pipeline.py`
 reaches back through it.
-
-Changes made by this port:
-
-- **ALI no longer calls this tool.** The server-side version existed partly so
-  `ALILogic.ensure_segmented()` could import it and segment raw meshes inline.
-  Tools do not call each other any more, so the server sequences CrownSeg before
-  ALI, and the report's `segmented_meshes` list is what it reads to do it.
-- **Scratch space lives under `output_dir`** (`.crownseg_work/`, removed in a
-  `finally` so it goes whichever way the run ends -- it holds a csv listing the
-  patient's own file paths), and `segment_crowns()` returns the run report
-  rather than a `CrownSegRun`. Arguments are validated *before* anything is
-  created, so a refused request leaves `output_dir` exactly as it found it.
-- **Zip extraction removed** -- the server unpacks archives before `run()`.
-- **The model is a required argument.** It used to be a name resolved through
-  the data store, with `default_model_path()` reading `settings.CROWNSEG_MODEL`;
-  weights now arrive as a `Path`, like every other tool.
-- **The GPU semaphore is gone** -- each call is its own process.
-
-## Working around a shapeaxi bug
-
-**CrownSeg does not currently run in the deployment, and did not before this
-port either.** `shapeaxi.dental_model_seg` -- the only supported way in -- reads
-`DentalModelSeg` off `shapeaxi.saxi_nets`, but in the 2.0.x line the class lives
-in `shapeaxi.saxi_nets_lightning`. Every 2.0.x release (2.0.0, 2.0.1, 2.0.2) has
-this; 1.x referenced the right module. Running the pre-port tool in the deployed
-container fails before it touches a mesh:
-
-```
-AttributeError: module 'shapeaxi.saxi_nets' has no attribute 'DentalModelSeg'
-```
-
-`_restore_moved_class()` in `pipeline.py` points the name back at where the class
-went, before calling shapeaxi's `main()`. Two lines rather than reimplementing
-`main()`, so the entry point stays the one shapeaxi supports; and it is guarded
-by `hasattr`, so it becomes a no-op the day a release puts the name back. **This
-should be reported at DCBIA-OrthoLab/ShapeAXI, and the function deleted once a
-release carries the fix.** Two tests cover it: that it restores the name, and
-that it does nothing when the name is already there.
 
 ## What it does
 
 | | |
 |---|---|
 | Inputs | `meshes`: one `.vtk`/`.stl` surface or a folder of them, searched recursively. `model`: the checkpoint. `output_dir`: where results go. |
-| Outputs | One labelled `.vtk` per mesh, named `<stem>_<suffix>.vtk`, plus `run_report.json`. The input tree is mirrored under `output_dir`; the meshes the network actually ran on are filed one level down, under `crownseg_input_<suffix>/`, which is shapeaxi's own csv-branch layout. `run_report.json` names every output, so a caller never has to know which branch a mesh took. |
-| Model files | One checkpoint, `07-21-22_val-loss0.169.pth` (6.6 MB), from the Fly-by-CNN 3.0 release. |
-| GPU | Used when available; `device="cpu"` works and is much slower. |
+| Outputs | One labelled `.vtk` per mesh, named `<stem>_<suffix>.vtk`, plus `run_report.json`. The input tree is mirrored under `output_dir`; the meshes the network actually ran on are filed one level down, under `crownseg_input_<suffix>/`, the layout shapeaxi's csv branch used. `run_report.json` names every output, so a caller never has to know which branch a mesh took. |
+| Model files | One checkpoint, `07-21-22_val-loss0.169.pth` (6.6 MB), from the Fly-by-CNN 3.0 release. It stays in `DATA/Crown_Seg/models/`; it is never part of this repository. |
+| Devices | `cuda`, `cpu`, and `mps` on macOS. The network runs on the device; the ray casting and the vote run on the host. |
 
-Three things worth knowing before reading a result:
+The published contract (arguments, types, defaults, choices, output names and
+the report) is the one the shapeaxi-based tool had. `num_workers` is still
+accepted and no longer does anything: it sized shapeaxi's DataLoader.
 
-- **An already-labelled mesh is passed through, not re-predicted.** That is what
-  makes a mixed batch of raw and pre-segmented meshes one call. Pass
+- **An already-labelled mesh is passed through, not re-predicted.** Pass
   `skip_segmented=False` to force the network to run anyway.
 - **A pre-segmented `.stl` is impossible** -- STL carries no point data by
   construction -- so every output is `.vtk`, whichever branch a mesh took.
 - **`numbering` changes the integers written into the array**, not the mesh.
   Whatever consumes the result has to agree; the report records which was used.
 
+## The checkpoint
+
+Read once and hashed, and the same bytes are given to `torch.load(...,
+weights_only=True, map_location="cpu")`: a file that holds anything but tensors
+and plain containers is refused, not executed. A file named
+`07-21-22_val-loss0.169.pth` must have sha256
+`9fa232d2eca9bf7bf6b6e7b03d48828d14f9369448e5ea7bfeb574474daabdbe`, or the run
+is refused (`ToolInputError`, answered 422). Another vintage under another name
+is loaded and its digest is logged, since `find_checkpoint` exists to allow it.
+The state dict is loaded strictly and no key prefix is stripped: the keys begin
+with `model.` because that is monai's own container name, and stripping it
+matches nothing.
+
+## Determinism
+
+shapeaxi's result depends on luck in two places, and both are settled here:
+
+1. The cameras that sit on an axis (8 of 42, by shapeaxi's own test) are nudged
+   by `torch.normal` drawn from the global generator, so a view can be oriented
+   differently on each run. The nudge now comes from a generator seeded with
+   `CAMERA_SEED`.
+2. `P_faces[:, pf] += pred` and `V_labels[faces_pid0] = P_faces` write to
+   repeated indices, and torch leaves the winner undefined: arbitrary on CUDA,
+   and racy on the CPU too once the thread pool is used (the same line gave a
+   different array on each call with 28 threads, and matched the last write only
+   with one). Both writes are done in numpy on the host, where the last value is
+   documented to win, after the network.
+
+This keeps shapeaxi's labels (last pixel of a face, last face of a vertex) and
+does **not** claim they are the right vote: one pixel per face per view and one
+face per vertex are kept and the rest discarded. `engine.predict(...,
+accumulate_pixels=True)` sums every pixel instead, so the alternative can be
+measured; it is not the default because it moves the labels away from the
+published method.
+
 ## Versions
 
-torch 2.11.0+cu128, torchvision 0.26.0+cu128, pytorch3d 0.7.9+pt2110cu128,
-vtk 9.6.2, numpy 2.3.2, Python 3.11.
+torch 2.11.0+cu128, vtk 9.6.2, numpy 2.3.2, Python 3.11; the `segmentation`
+extra adds monai 1.6.0 and embreex 4.4.0.post1.
 
-These follow **upstream SlicerAutomatedDentalTools**, which is the reference:
-its shared `shapeaxi` conda env is created with `ocnn==2.2.1`,
-`shapeaxi>=2.0.2` and `SimpleITK`, and every pytorch3d-dependent module (ALI,
-AREG, ASO, DOCShapeAXI, FlexReg) ships an `install_pytorch.py` that reads
-<https://ImageMindAnalytics.github.io/pytorch3d-wheels/simple/> and picks the
-wheel whose `+ptXXXcuYYY` tag matches the installed torch. The earlier
-`torch==2.8.0` here came from this port, not from upstream.
-
-```toml
-[project.optional-dependencies]
-segmentation = [
-    "shapeaxi>=2.0.2", "ocnn==2.2.1", "SimpleITK",
-    "pytorch3d==0.7.9+pt2110cu128", "torchvision==0.26.0",
-]
-```
-
-**We are deliberately stricter than upstream on one point**: upstream leaves
-torch unpinned, so it arrives as a shapeaxi dependency and resolves to whatever
-is current. We pin `torch==2.11.0`. An unpinned torch is not reproducible -- the
-same `uv sync` two months apart gives two different runtimes -- and the pytorch3d
-wheel tag names one torch version and one CUDA variant *exactly*. Bumping torch
-therefore means bumping the pytorch3d tag in the same commit; they are one
-decision, not two.
-
-### Python 3.11, not 3.12
-
-Upstream moved this env to 3.12 because shapeaxi 1.0.10 pinned
-`grpcio==1.51.1`, which has no cp312 wheel. shapeaxi 2.0.2 dropped that pin, so
-grpcio resolves to 1.83.0, which publishes cp311 wheels -- the reason for the
-move no longer applies. Verified rather than assumed: the full set
-(shapeaxi 2.0.2, ocnn 2.2.1, torch 2.11.0, pytorch3d, monai, itk) resolves on
-3.11 in under a second.
-
-### The four numbers that must agree
-
-pytorch3d and torchvision both ship compiled extensions linked against one
-specific torch build. Three numbers have to line up -- torch version, CUDA
-variant, Python ABI -- and a mismatch is **not** an install error: the package
-imports fine and dies on the first CUDA kernel.
-
-```toml
-[[tool.uv.index]]
-name = "pytorch3d-wheels"
-url = "https://ImageMindAnalytics.github.io/pytorch3d-wheels/simple/"
-explicit = true      # a PINNED SOURCE, never --extra-index-url
-
-[tool.uv.sources]
-torch       = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-pytorch3d   = { index = "pytorch3d-wheels" }
-```
-
-- `explicit = true` is what makes these pinned sources. As extra index URLs uv
-  is free to mix registries: a torch `2.11.0+cu130` paired with a
-  `pt2120cu126` wheel, failing at runtime on a missing `libcudart.so.12`.
-- **`torchvision` is listed as a direct dependency**, for the same reason
-  `pytorch3d` is: `tool.uv.sources` applies to direct dependencies only. Left
-  transitive through shapeaxi it comes from PyPI, and PyPI's torchvision is
-  built against the default torch rather than the cu128 one. The version
-  pairing is right (0.26 ↔ 2.11) and it still fails, with
-  `RuntimeError: operator torchvision::nms does not exist`. Measured here, not
-  anticipated.
-- pytorch3d is no longer compiled from git. Upstream installs a prebuilt wheel
-  and so do we, which removes the CUDA toolkit and the tens of minutes.
-
-`uv lock` resolves 172 packages in under a second.
-
-### Verified on the GPU
-
-An import proves nothing; the wheel has to run a kernel:
-
-```
-torch 2.11.0+cu128   CUDA 12.8   NVIDIA RTX 6000 Ada Generation
-torchvision 0.26.0+cu128         torchvision::nms registered
-pytorch3d 0.7.9+pt2110cu128      knn_points on cuda -> OK
-```
-
-End to end on `T1_01_U_segmented.vtk` (294,260 points) with
-`skip_segmented=False` to force the engine: **52.3 s**, 15 distinct tooth
-labels, and `PredictedID` **bit-identical to the reference -- 0 of 294,260
-points differ**.
-
-`PredictedID` is the array to compare, and the only one. It is the network's
-raw per-point prediction; `Universal_ID` is shapeaxi's post-processed
-labelling, which the section below shows is not deterministic between two runs
-of the *same* code. Bit-identical `PredictedID` under torch 2.11 + pytorch3d
-0.7.9+pt2110cu128 therefore says the version move does not perturb inference at
-all -- a stronger statement than any agreement percentage, and the same result
-the pre-port validation recorded against torch 2.8.
-
-`uv sync --extra segmentation` no longer compiles anything: the wheel is
-prebuilt, so there is nothing to cache in a local `/wheels` directory.
-
-## Validated against
-
-- **Input**: `DATA/CrownSeg/testfiles/T1_01_U_segmented.vtk` (294 260 points),
-  with `skip_segmented=False` so the network actually runs -- the published test
-  mesh is already labelled.
-- **Weights**: `07-21-22_val-loss0.169.pth`, staged from the release named in the
-  server's manifest and checked against its recorded size.
-- **Reference**: the pre-port implementation **plus the same shapeaxi
-  workaround**, since without it the reference cannot run at all. Both were run
-  inside the deployed container, so the engine, the weights and the GPU are
-  identical and only the tool code differs.
-- **Result**: same geometry (294 260 points, 588 244 cells, points bit-identical)
-  and the same two output arrays.
-
-| Array | What it is | Port vs reference |
-|---|---|---|
-| `PredictedID` | the network's raw per-point prediction | **bit-identical**, 0 of 294 260, in all four runs |
-| `Universal_ID` | shapeaxi's post-processed labelling | varies run to run, including between two references |
-
-```
-Universal_ID: differing points of 294260
-            ref1    ref2    ref3    port
-ref1           0    2174    1216     930
-ref2        2174       0    2361    2607
-ref3        1216    2361       0     826
-port         930    2607     826       0
-```
-
-- **Tolerance**: none of the difference is attributable to the repackaging.
-  `PredictedID` -- everything the network produces -- is identical every time, so
-  the port demonstrably does not touch inference. `Universal_ID` comes out of
-  shapeaxi's own "closing operation", which is not deterministic: two
-  *reference* runs differ by 1 216-2 361 points, and the port's spread against
-  them (826-2 607) is the same range. **Treat a difference in `PredictedID` as a
-  regression**; `Universal_ID` alone is this noise floor.
-
-**GPU tests**: four tests are marked `models`, two of them also `gpu`, and both
-markers are **deselected by default** (`addopts = "-m 'not gpu and not models'"`)
-rather than skipped -- a green line that is half skips says nothing. They now run
-through pytest rather than by hand: pytorch3d arrives as a prebuilt wheel, so
-there is no CUDA toolkit to want. Last run, on the real checkpoint and
-`T1_01_U_segmented.vtk`:
-
-```
-SADT_CROWNSEG_MODEL=.../07-21-22_val-loss0.169.pth \
-SADT_CROWNSEG_MESH=.../T1_01_U_segmented.vtk \
-uv run pytest -m models -o addopts=      # 4 passed in 119s
-```
-
-The other 176 tests stub the engine and run anywhere, which is what CI does.
+`uv lock` holds 49 packages where the shapeaxi stack held 172. Nothing links
+against torch's ABI any more, so torch is pinned for reproducibility only, and
+there is no pytorch3d wheel index, no torchvision and no CUDA toolkit to match.
+Python stays at 3.11, the deployment image's interpreter, so the lock and the
+image do not move with this change. open3d is not a dependency.
 
 ## Working on it
 
 ```bash
 cd tools/Crown_Seg
-uv sync                          # fast: no shapeaxi, no pytorch3d
-uv run pytest                    # 176 tests, engine stubbed
-uv sync --extra segmentation     # prebuilt pytorch3d wheel, nothing compiles
-uv run pytest -m models -o addopts=   # see tests/data/README.md
+uv sync                          # torch, vtk, numpy
+uv run pytest                    # the engine is stubbed; engine tests skip without the extra
+uv sync --extra segmentation     # monai and embreex, two small packages
+uv run pytest                    # now the engine tests run as well, on a synthetic mesh
+SADT_CROWNSEG_MODEL=... SADT_CROWNSEG_MESH=... uv run pytest -m models -o addopts=
 ```
 
 ```bash
