@@ -344,3 +344,48 @@ def test_the_installed_engine_is_the_documented_release():
             assert version(package).split("+")[0] == pin.split("+")[0], package
         except PackageNotFoundError:  # pragma: no cover - the extra is partial
             pytest.fail(f"{package} is missing from an installed extra")
+
+
+# ---------------------------------------------------------------------------
+# The published contract, frozen
+# ---------------------------------------------------------------------------
+
+# The schema of the shapeaxi-based tool at commit 81f8459, minus the prose: what
+# a client sends and what it is shown as a field. Descriptions are left out on
+# purpose (a sentence that stopped being true may be corrected); everything else
+# is the contract and may not move with the engine.
+PUBLISHED_ARGUMENTS = {
+    "meshes": {"type": "path", "required": True},
+    "output_dir": {"type": "path", "required": True},
+    "model": {"type": "path", "required": False, "default": "", "hidden": True},
+    "array_name": {"type": "str", "required": False, "default": "", "hidden": True},
+    "suffix": {"type": "str", "required": False, "default": "Seg"},
+    "numbering": {"type": "str", "required": False, "default": "Universal",
+                  "choices": ["Universal", "FDI"], "label": "Tooth numbering"},
+    "skip_segmented": {"type": "bool", "required": False, "default": True},
+    "device": {"type": "str", "required": False,
+               "default": "mps" if sys.platform == "darwin" else "cuda",
+               "choices": ["cuda", "cpu", "mps"] if sys.platform == "darwin" else ["cuda", "cpu"]},
+    "num_workers": {"type": "int", "required": False, "default": 2},
+}
+
+
+def test_the_published_arguments_are_exactly_the_ones_the_shapeaxi_tool_had():
+    script = REPO_ROOT / "scripts" / "describe.py"
+    if not script.is_file():
+        pytest.skip("run from a full SADT-VISOR checkout")
+
+    finished = subprocess.run(
+        [sys.executable, str(script), str(TOOL_DIR)], capture_output=True, text=True, check=False,
+    )
+    assert finished.returncode == 0, finished.stderr
+    schema = json.loads(finished.stdout)
+
+    got = {
+        name: {key: value for key, value in spec.items() if key != "description"}
+        for name, spec in schema["arguments"].items()
+    }
+    # The default is "mps" on a Mac only because commit 81f8459 made it so.
+    assert got == PUBLISHED_ARGUMENTS
+    assert schema["supervisor"] is True
+    assert schema["returns"] == "path"
