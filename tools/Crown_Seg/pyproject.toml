@@ -2,17 +2,18 @@
 name = "sadt-crownseg"
 version = "0.1.0"
 description = "Label every tooth of an intraoral scan with its dental number."
-# The deployment image's interpreter (lab-ai:2026.08, python 3.11.13), and the
-# only one pytorch3d is built for there.
+# The deployment image's interpreter (lab-ai:2026.08, python 3.11.13). It used
+# to be the only one pytorch3d was built for; nothing here needs that any more,
+# and it is kept so the lock and the image do not move with this change.
 requires-python = ">=3.11,<3.12"
-# Everything the tool needs EXCEPT the segmentation engine. Kept apart on
-# purpose -- see the extra below and README.md.
+# Everything the tool needs EXCEPT the segmentation engine's two extra packages.
+# Kept apart on purpose -- see the extra below and README.md.
 dependencies = [
-    # Upstream's shared "shapeaxi" conda env leaves torch unpinned, so it
-    # resolves to whatever is current (>= 2.11 today). We are deliberately
-    # STRICTER: an unpinned torch is not reproducible, and the pytorch3d wheel
-    # tag (`+pt2110cu128`) names one torch version and one CUDA variant
-    # exactly. Bumping torch here means bumping that tag in the same commit.
+    # Pinned: an unpinned torch is not reproducible, and the same `uv sync` two
+    # months apart gives two different runtimes. It used to be pinned for a
+    # second reason, the pytorch3d wheel tag (`+pt2110cu128`) that named one
+    # torch version exactly; nothing here links against torch's ABI any more,
+    # so the pin is now only about reproducibility.
     "torch==2.11.0",
     "vtk==9.6.2",
     "numpy==2.3.2",
@@ -23,10 +24,6 @@ dependencies = [
     "filelock<3.30",
 ]
 
-# The engine, matching upstream SlicerAutomatedDentalTools' shared env:
-# shapeaxi >= 2.0.2 (2.0.3 here, see below), ocnn == 2.2.1, SimpleITK. It stays an extra so a plain
-# `uv sync` can still import the package and publish its schema without
-# pulling the GPU stack; `uv sync --extra segmentation` builds the real thing.
 # What makes this directory a tool. A directory holding a pyproject.toml
 # WITHOUT this section -- a shared path dependency, the testkit -- is a plain
 # package: importable, installable, never discovered or served.
@@ -39,23 +36,21 @@ dependencies = [
 tool = true
 name = "Crown_Seg"
 
+# The engine. It is shapeaxi's `dentalmodelseg` carried over to torch, monai,
+# VTK and Embree, so nothing here needs shapeaxi, pytorch3d, torchvision,
+# lightning, ocnn, SimpleITK or open3d, and none of them is installed. It stays
+# an extra so a plain `uv sync` can still import the package and publish its
+# schema without the engine; `uv sync --extra segmentation` builds the real
+# thing, and it is two small packages, not a GPU stack.
 [project.optional-dependencies]
 segmentation = [
-    # 2.0.3 and no earlier: every 2.0.x before it had `dental_model_seg` read
-    # DentalModelSeg off `saxi_nets`, where the class no longer is, and the
-    # tool had to put it back by hand. 2.0.3 changes those two lines only.
-    "shapeaxi>=2.0.3",
-    "ocnn==2.2.1",
-    "SimpleITK",
-    "pytorch3d==0.7.9+pt2110cu128",
-    # Transitive through shapeaxi, listed here for the SAME reason pytorch3d
-    # is: sources apply to direct dependencies only. Left transitive it comes
-    # from PyPI, and PyPI's torchvision is built against the default torch
-    # rather than the cu128 one -- the version pairing is right (0.26 <-> 2.11)
-    # but the C extension links a different build, so importing it raises
-    # `RuntimeError: operator torchvision::nms does not exist`. Measured, not
-    # anticipated.
-    "torchvision==0.26.0",
+    # The 2D U-Net's library. The same version ALI_IOS pins, for the same
+    # network family.
+    "monai==1.6.0",
+    # The ray caster behind `render_native.py`, which replaces pytorch3d's
+    # rasterizer. Pinned to the version the macOS recipe installs for the other
+    # IOS tools.
+    "embreex==4.4.0.post1",
 ]
 
 [dependency-groups]
@@ -69,22 +64,11 @@ build-backend = "hatchling.build"
 packages = ["src/sadt_crownseg"]
 
 # `explicit` is load-bearing: without it uv looks for EVERY package on the
-# PyTorch index, and most of them are not there.
+# PyTorch index, and most of them are not there. It is also what keeps torch on
+# the one CUDA variant the deployment image carries.
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-# The prebuilt pytorch3d wheels upstream itself installs from: every ALI/AREG/
-# ASO/DOCShapeAXI/FlexReg module ships an `install_pytorch.py` that reads this
-# index and picks the wheel whose `+ptXXXcuYYY` tag matches the installed
-# torch. `explicit` is what makes it a PINNED SOURCE rather than an extra
-# index: as an `--extra-index-url` uv is free to mix registries, which is how
-# a torch 2.11.0+cu130 got paired with a pt2120cu126 wheel -- it imports and
-# then dies on the first CUDA kernel with a missing libcudart.
-[[tool.uv.index]]
-name = "pytorch3d-wheels"
-url = "https://ImageMindAnalytics.github.io/pytorch3d-wheels/simple/"
 explicit = true
 
 [tool.uv.sources]
@@ -94,17 +78,6 @@ explicit = true
 # [project] dependencies -- see testkit/README.md.
 sadt-testkit = { path = "../../testkit", editable = true }
 torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-# pytorch3d has no usable PyPI distribution (newest there is 0.7.4, cp38-cp310
-# only), which is why it used to be compiled from git against the pinned torch
-# -- tens of minutes and a CUDA toolkit. Upstream does not do that: it installs
-# a prebuilt wheel from the index above, and so do we now.
-#
-# It is listed in the extra ABOVE as a direct dependency even though shapeaxi
-# pulls it transitively, because `tool.uv.sources` only applies to direct
-# dependencies -- left transitive, uv ignores this source and fails with
-# "no wheels with a matching Python version tag".
-pytorch3d = { index = "pytorch3d-wheels" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

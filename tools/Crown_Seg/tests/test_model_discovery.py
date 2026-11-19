@@ -19,7 +19,7 @@ import pytest
 from sadt_crownseg import pipeline
 from sadt_crownseg.errors import ToolInputError
 
-from test_run import stub_shapeaxi, write_surface  # noqa: F401 - fixture + helper
+from test_run import stub_engine_run, write_surface  # noqa: F401 - fixture + helper
 
 
 # The published crown checkpoint, and the neighbours it has to be told apart
@@ -163,7 +163,7 @@ def test_what_counts_as_a_crown_checkpoint(name, recognised):
 # End to end
 # ---------------------------------------------------------------------------
 
-def test_a_folder_works_as_the_model_argument_of_a_whole_run(tmp_path, stub_shapeaxi):
+def test_a_folder_works_as_the_model_argument_of_a_whole_run(tmp_path, stub_engine_run):
     """What ALI_IOS's supervised call actually does."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
     bundle = write_bundle(
@@ -178,10 +178,10 @@ def test_a_folder_works_as_the_model_argument_of_a_whole_run(tmp_path, stub_shap
 
     assert report["summary"]["segmented"] == 1
     # shapeaxi was handed the checkpoint, never the folder.
-    assert stub_shapeaxi[0]["model"] == os.path.join(bundle, "Crown_Seg_Model", CROWN)
+    assert stub_engine_run[0]["model"] == os.path.join(bundle, "Crown_Seg_Model", CROWN)
 
 
-def test_the_report_says_which_checkpoint_ran(tmp_path, stub_shapeaxi):
+def test_the_report_says_which_checkpoint_ran(tmp_path, stub_engine_run):
     """`model` no longer answers that on its own: it may be a folder holding
     several vintages, and the one picked out of it is what a result has to be
     attributable to."""

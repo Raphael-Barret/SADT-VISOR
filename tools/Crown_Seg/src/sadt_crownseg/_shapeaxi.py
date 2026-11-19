@@ -11,13 +11,15 @@ pulls in lightning, ocnn, h5py, scikit-learn, torchvision, pillow, nibabel,
 fslpy and itk for two small classes this pipeline uses. The functions here are
 the ones the dental segmentation actually executes.
 
-One edit, marked in place: ReadSurf's .off and .gii branches are removed, as
-they need OFFReader, nibabel and fslpy and no intraoral scan uses them.
+Two edits, each marked in place: ReadSurf's .off and .gii branches are removed,
+as they need OFFReader, nibabel and fslpy and no intraoral scan uses them; and
+Write sets the `SPACE=LPS` header every .vtk of this repository carries.
 
 This copy comes from the lab's `iosseg` package. Every function other than
-ReadSurf was compared, by AST dump, with the same function in shapeaxi 2.0.2
-(utils.py and post_process.py) and is identical; ReadSurf differs by the edit
-above only. `engine.py` is the only module that calls into it.
+ReadSurf and Write was compared, by AST dump, with the same function in
+shapeaxi 2.0.2 (utils.py and post_process.py) and is identical; those two
+differ by the edits above only. `engine.py` is the only module that calls into
+it.
 """
 import math
 import os
@@ -89,10 +91,14 @@ def ReadSurf(fileName):
     return surf
 
 def Write(vtkdata, output_name, print_out = True):
+    # EDIT: the SPACE=LPS header line, which every legacy .vtk this repository
+    # writes carries (scripts/tests/test_vtk_headers.py): Slicer reads a .vtk
+    # without one as LPS anyway and logs a warning on every load.
     outfilename = output_name
     if print_out == True:
         print("Writing:", outfilename)
     polydatawriter = vtk.vtkPolyDataWriter()
+    polydatawriter.SetHeader("SPACE=LPS")
     polydatawriter.SetFileName(outfilename)
     polydatawriter.SetInputData(vtkdata)
     polydatawriter.Write()

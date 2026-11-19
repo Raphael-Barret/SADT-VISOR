@@ -77,13 +77,13 @@ def test_the_work_directory_does_not_survive_an_engine_that_raised(
 ):
     """It holds a csv listing the patient's own file paths, so it must go
     whichever way the run ends."""
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
 
     def explode(**kwargs):
         raise RuntimeError("CUDA out of memory")
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", explode)
+    monkeypatch.setattr(pipeline, "_run_engine", explode)
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
@@ -101,7 +101,7 @@ def test_the_work_directory_does_not_survive_a_run_that_produced_nothing(
 ):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
-    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; shapeaxi returned without error"):
+    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; the engine returned without error"):
         pipeline.segment_crowns(
             input_path=str(tmp_path / "cohort"),
             model_path=str(model_file),
@@ -427,7 +427,7 @@ def test_one_mesh_the_engine_could_not_write_does_not_cost_the_batch(
 ):
     """Forty patients, one unreadable file: the other thirty-nine must come
     back."""
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
 
     def only_the_first(csv_path, output_dir, model_path, input_root, array_name, suffix,
@@ -440,7 +440,7 @@ def test_one_mesh_the_engine_could_not_write_does_not_cost_the_batch(
             labelled=True,
         )
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", only_the_first)
+    monkeypatch.setattr(pipeline, "_run_engine", only_the_first)
     write_surface(tmp_path / "cohort" / "a.vtk")
     write_surface(tmp_path / "cohort" / "b.vtk")
 
@@ -465,7 +465,7 @@ def test_a_run_that_produced_nothing_at_all_is_a_failure_not_an_empty_report(
     """An empty archive and a green status is the worst answer available."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
-    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; shapeaxi returned without error"):
+    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; the engine returned without error"):
         pipeline.segment_crowns(
             input_path=str(tmp_path / "cohort"),
             model_path=str(model_file),
@@ -583,7 +583,7 @@ def test_a_very_long_cause_is_cut_to_fit_the_reason():
 
 
 def _engine_failing_after_the_first(monkeypatch, message):
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
 
     def write_one_then_fail(csv_path, output_dir, model_path, input_root, array_name,
@@ -597,10 +597,10 @@ def _engine_failing_after_the_first(monkeypatch, message):
         )
         raise RuntimeError(message)
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", write_one_then_fail)
+    monkeypatch.setattr(pipeline, "_run_engine", write_one_then_fail)
 
 
-def test_a_shapeaxi_failure_says_what_failed_and_how_far_it_got(
+def test_an_engine_failure_says_what_failed_and_how_far_it_got(
     tmp_path, monkeypatch, model_file, caplog
 ):
     _engine_failing_after_the_first(monkeypatch, DATALOADER_FAILURE)
@@ -625,23 +625,23 @@ def test_a_shapeaxi_failure_says_what_failed_and_how_far_it_got(
     assert "Original Traceback" not in message
     assert "segmenting 3 mesh(es) on cpu" in caplog.text
     assert (
-        "shapeaxi failed after 1 of 3 meshes were written "
+        "the engine failed after 1 of 3 meshes were written "
         "(ValueError: mesh has 0 points)"
     ) in caplog.text
     assert "worker.py" not in caplog.text
 
 
-def test_a_value_error_out_of_shapeaxi_is_not_answered_as_the_callers_fault(
+def test_a_value_error_out_of_the_engine_is_not_answered_as_the_callers_fault(
     tmp_path, monkeypatch, model_file
 ):
     """ValueError maps to 422; a crash inside the bundled engine is a 500."""
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
 
     def explode(**kwargs):
         raise ValueError("size mismatch for model.0.conv.unit0.conv.weight")
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", explode)
+    monkeypatch.setattr(pipeline, "_run_engine", explode)
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     with pytest.raises(RuntimeError) as failure:
@@ -671,7 +671,7 @@ def test_an_engine_that_writes_nothing_says_it_returned_without_error(
             )
 
     assert str(failure.value) == (
-        "0 of 2 meshes segmented; shapeaxi returned without error but wrote "
+        "0 of 2 meshes segmented; the engine returned without error but wrote "
         "none of the 2 expected outputs"
     )
     assert "mesh 1 of 2: segmentation failed" in caplog.text
@@ -699,7 +699,7 @@ def test_a_complete_run_closes_with_an_info_summary(
 
 
 def test_a_partial_run_closes_with_a_warning_summary(tmp_path, monkeypatch, model_file, caplog):
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
 
     def only_the_first(csv_path, output_dir, model_path, input_root, array_name, suffix,
@@ -712,7 +712,7 @@ def test_a_partial_run_closes_with_a_warning_summary(tmp_path, monkeypatch, mode
             labelled=True,
         )
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", only_the_first)
+    monkeypatch.setattr(pipeline, "_run_engine", only_the_first)
     write_surface(tmp_path / "cohort" / "a.vtk")
     write_surface(tmp_path / "cohort" / "b.vtk")
 

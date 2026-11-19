@@ -1,10 +1,10 @@
 """The claims README.md and pyproject.toml make, asserted rather than described.
 
-Four numbers have to line up for this tool to run at all -- torch version, CUDA
-variant, Python ABI, and the pytorch3d wheel tag that names the first two. A
-mismatch is not an install error: the package imports fine and dies on the
-first CUDA kernel. So the pins are checked here, where a change to one of them
-fails a test instead of a clinician's run.
+The pins are checked here, where a change to one of them fails a test instead of
+a clinician's run. There used to be a fourth number to keep in step, the
+pytorch3d wheel tag that named a torch version and a CUDA variant exactly; the
+engine no longer links against torch's ABI, so torch is pinned for
+reproducibility alone.
 """
 
 import ast
@@ -53,7 +53,7 @@ def extra_is_installed() -> bool:
     import importlib.util
 
     try:
-        return importlib.util.find_spec("shapeaxi") is not None
+        return all(importlib.util.find_spec(name) is not None for name in ("monai", "embreex"))
     except (ImportError, ValueError):
         # A shadowed or half-removed distribution: `find_spec` raises rather
         # than answering, and "not installed" is the honest reading.
@@ -66,9 +66,8 @@ def extra_is_installed() -> bool:
 
 BASE_PINS = {"torch": "2.11.0", "vtk": "9.6.2", "numpy": "2.3.2"}
 EXTRA_PINS = {
-    "ocnn": "2.2.1",
-    "pytorch3d": "0.7.9+pt2110cu128",
-    "torchvision": "0.26.0",
+    "monai": "1.6.0",
+    "embreex": "4.4.0.post1",
 }
 
 
@@ -84,33 +83,18 @@ def test_the_base_dependencies_are_pinned_to_the_documented_version(package, pin
 @pytest.mark.parametrize("package, pin", sorted(EXTRA_PINS.items()))
 def test_the_engine_extra_pins_the_documented_versions(package, pin):
     """These arrive only with `--extra segmentation`, so the pin is what is
-    always checkable. `pytorch3d==0.7.9+pt2110cu128` names one torch version
-    and one CUDA variant exactly."""
+    always checkable."""
     extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
     assert f"{package}=={pin}" in extra
 
 
-def test_the_pytorch3d_wheel_tag_names_the_torch_that_is_pinned():
-    """Bumping torch means bumping the wheel tag in the same commit; they are
-    one decision, not two. `+pt2110` is torch 2.11.0."""
+def test_the_engine_extra_holds_nothing_that_needs_pytorch3d():
+    """The point of this variant: not shapeaxi, not pytorch3d, nothing that
+    pulls either, and not open3d. Only what `engine.py` imports."""
     extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    wheel = next(entry for entry in extra if entry.startswith("pytorch3d"))
-    torch_pin = next(
-        entry for entry in pyproject()["project"]["dependencies"]
-        if entry.startswith("torch==")
-    )
+    names = {entry.split("==")[0].lower() for entry in extra}
 
-    major, minor, _ = torch_pin.split("==")[1].split(".")
-    assert f"+pt{major}{int(minor):02d}0" in wheel
-
-
-def test_shapeaxi_is_asked_for_at_least_the_release_that_finds_its_own_class():
-    """2.0.0 to 2.0.2 looked DentalModelSeg up in `saxi_nets`, where it no
-    longer was; the tool patched it back and logged a warning on every run.
-    2.0.3 reads it from `saxi_nets_lightning`, so nothing here patches it."""
-    extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    assert "shapeaxi>=2.0.3" in extra
-    assert not hasattr(pipeline, "_restore_moved_class")
+    assert names == {"monai", "embreex"}
 
 
 def test_torch_is_pinned_although_upstream_leaves_it_unpinned():
@@ -122,38 +106,26 @@ def test_torch_is_pinned_although_upstream_leaves_it_unpinned():
     assert any(entry.startswith("torch==") for entry in dependencies)
 
 
-def test_torchvision_is_a_direct_dependency_of_the_extra():
-    """`tool.uv.sources` applies to direct dependencies only. Left transitive
-    through shapeaxi it comes from PyPI, built against the default torch, and
-    importing it raises `operator torchvision::nms does not exist`."""
-    extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    assert any(entry.startswith("torchvision==") for entry in extra)
-    assert "torchvision" not in imported_names(), "nothing imports it by name"
-
-
-@pytest.mark.parametrize("index", ["pytorch-cu128", "pytorch3d-wheels"])
-def test_both_wheel_indexes_are_pinned_sources_not_extra_index_urls(index):
-    """`explicit = true` is what makes them pinned sources. As extra index URLs
-    uv is free to mix registries: a torch 2.11.0+cu130 paired with a
-    pt2120cu126 wheel, failing at runtime on a missing libcudart."""
-    entry = next(item for item in pyproject()["tool"]["uv"]["index"] if item["name"] == index)
+def test_the_pytorch_index_is_a_pinned_source_not_an_extra_index_url():
+    """`explicit = true` is what makes it a pinned source. As an extra index URL
+    uv is free to mix registries and could pair a torch built for one CUDA
+    variant with packages built for another."""
+    entry = next(item for item in pyproject()["tool"]["uv"]["index"] if item["name"] == "pytorch-cu128")
 
     assert entry["explicit"] is True
+    assert [item["name"] for item in pyproject()["tool"]["uv"]["index"]] == ["pytorch-cu128"]
 
 
-@pytest.mark.parametrize(
-    "package, index",
-    [("torch", "pytorch-cu128"), ("torchvision", "pytorch-cu128"),
-     ("pytorch3d", "pytorch3d-wheels")],
-)
-def test_each_compiled_package_comes_from_the_index_it_was_built_for(package, index):
-    assert pyproject()["tool"]["uv"]["sources"][package] == {"index": index}
+def test_torch_comes_from_the_index_it_was_built_for_and_nothing_else_is_redirected():
+    sources = pyproject()["tool"]["uv"]["sources"]
+
+    assert sources["torch"] == {"index": "pytorch-cu128"}
+    assert set(sources) == {"torch", "sadt-testkit"}
 
 
-def test_the_interpreter_is_the_one_pytorch3d_is_built_for_here():
-    """Upstream moved this env to 3.12 because shapeaxi 1.0.10 pinned
-    grpcio==1.51.1, which has no cp312 wheel; 2.0.2 dropped that pin, so the
-    reason for the move no longer applies."""
+def test_the_interpreter_is_the_deployment_images():
+    """Kept at the image's 3.11 so the lock and the image do not move with this
+    change; pytorch3d no longer forces it."""
     assert pyproject()["project"]["requires-python"] == ">=3.11,<3.12"
     assert sys.version_info[:2] == (3, 11)
 
@@ -333,8 +305,8 @@ def test_importing_the_package_pulls_in_no_engine():
 
 
 def test_the_pipeline_defers_every_heavy_import():
-    """vtk, torch and shapeaxi are all imported inside the function that needs
-    them, for the same reason."""
+    """vtk, torch and the engine's packages are all imported inside the function
+    that needs them, for the same reason."""
     top_level = set()
     module = TOOL_DIR / "src" / "sadt_crownseg" / "pipeline.py"
     for node in ast.parse(module.read_text(encoding="utf-8")).body:
@@ -343,7 +315,7 @@ def test_the_pipeline_defers_every_heavy_import():
         elif isinstance(node, ast.ImportFrom) and node.module:
             top_level.add(node.module.split(".")[0])
 
-    for heavy in ("vtk", "torch", "shapeaxi"):
+    for heavy in ("vtk", "torch", "monai", "embreex", "numpy"):
         assert heavy not in top_level, heavy
 
 
@@ -367,7 +339,6 @@ def test_the_public_surface_is_run_alone():
 def test_the_installed_engine_is_the_documented_release():
     """Only checkable where the extra is installed; the pin above is what CI
     can see."""
-    assert version("shapeaxi") == "2.0.3"
     for package, pin in EXTRA_PINS.items():
         try:
             assert version(package).split("+")[0] == pin.split("+")[0], package

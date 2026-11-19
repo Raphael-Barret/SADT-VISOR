@@ -1,10 +1,10 @@
 """Fixtures shared by the CrownSeg suites.
 
 The network cannot run in CI -- it lives behind the `segmentation` extra,
-because shapeaxi needs pytorch3d -- so the engine is stubbed and everything
+because it needs monai and embreex, which a CI venv does not install -- so the engine is stubbed and everything
 around it runs for real: VTK writes the meshes, the discovery walks a real
-tree, the report is the real report. `_import_dental_model_seg` is stubbed too:
-replacing only `_run_shapeaxi` leaves a half-stubbed world where the import
+tree, the report is the real report. `_import_engine` is stubbed too:
+replacing only `_run_engine` leaves a half-stubbed world where the import
 probe still fails and an already-labelled mesh comes back `engine_unavailable`.
 """
 
@@ -79,7 +79,7 @@ def stub_engine(monkeypatch, model_file):
     Returns the list of calls, so a test can assert on the namespace the engine
     was handed as well as on what came out.
     """
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     calls = []
 
     def fake_run(csv_path, output_dir, model_path, input_root, array_name, suffix,
@@ -106,7 +106,7 @@ def stub_engine(monkeypatch, model_file):
             )
             write_surface(destination, labelled=True, array_name=array_name)
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", fake_run)
+    monkeypatch.setattr(pipeline, "_run_engine", fake_run)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
     return calls
 
@@ -114,9 +114,9 @@ def stub_engine(monkeypatch, model_file):
 @pytest.fixture
 def failing_engine(monkeypatch, model_file):
     """An engine that runs but produces no output for any mesh."""
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", lambda **kwargs: None)
+    monkeypatch.setattr(pipeline, "_run_engine", lambda **kwargs: None)
 
 
 @pytest.fixture
@@ -125,8 +125,8 @@ def absent_engine(monkeypatch, model_file):
     def refuse():
         raise pipeline.ToolUnavailableError(
             "CrownSeg's engine is an optional extra. Install it with "
-            "`uv sync --extra segmentation` in tools/Crown_Seg. (missing: shapeaxi)"
+            "`uv sync --extra segmentation` in tools/Crown_Seg. (missing: monai)"
         )
 
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", refuse)
+    monkeypatch.setattr(pipeline, "_import_engine", refuse)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")

@@ -1,4 +1,4 @@
-"""CrownSeg -- per-tooth labelling of intraoral surface scans, via shapeaxi.
+"""CrownSeg -- per-tooth labelling of intraoral surface scans.
 
 The pipeline is in pipeline.py; only `run` is public.
 """
@@ -90,9 +90,9 @@ def run(
             what makes a mixed batch of raw and pre-segmented meshes one call.
         device: "cuda" or "cpu". CUDA falls back to CPU when no card is
             visible, with a warning.
-        num_workers: DataLoader workers shapeaxi uses to load meshes. Forced to
-            at least 1: shapeaxi builds its loader with persistent_workers=True,
-            which PyTorch rejects at 0.
+        num_workers: Accepted for compatibility and no longer used: it sized the
+            data loader of the engine this tool used to call. Meshes are read in
+            the calling process.
 
     Returns:
         The output directory, holding the labelled meshes and the run report.

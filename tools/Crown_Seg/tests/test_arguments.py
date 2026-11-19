@@ -149,51 +149,6 @@ def test_numbering_reaches_the_engine_as_the_flag_it_expects(
     assert read_report(output)["numbering"] == recorded
 
 
-def test_the_fdi_flag_is_an_integer_because_shapeaxi_reads_it_as_one(tmp_path, monkeypatch):
-    """`cml()` builds `fdi` from an int argument; a bool would work by accident
-    today and stop the day shapeaxi compares it to 1."""
-    seen = {}
-
-    class FakeModule:
-        @staticmethod
-        def main(args):
-            seen.update(vars(args))
-
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: FakeModule)
-
-    pipeline._run_shapeaxi(
-        csv_path="x.csv", output_dir=str(tmp_path), model_path="m.pth",
-        input_root=str(tmp_path), array_name="Universal_ID", suffix="Seg",
-        device="cpu", fdi=True, num_workers=2,
-    )
-
-    # `type(...) is int`, not `isinstance`: bool is a subclass of int, so
-    # isinstance would accept exactly the value this test exists to refuse.
-    assert seen["fdi"] == 1 and type(seen["fdi"]) is int
-
-
-def test_the_crown_segmentation_flags_are_integers_too(tmp_path, monkeypatch):
-    """Same reason: shapeaxi's `cml()` builds all four of these from int
-    arguments, and a bool works by accident until one of them is compared."""
-    seen = {}
-
-    class FakeModule:
-        @staticmethod
-        def main(args):
-            seen.update(vars(args))
-
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: FakeModule)
-
-    pipeline._run_shapeaxi(
-        csv_path="x.csv", output_dir=str(tmp_path), model_path="m.pth",
-        input_root=str(tmp_path), array_name="Universal_ID", suffix="Seg",
-        device="cpu", fdi=False, num_workers=2,
-    )
-
-    for field in ("fdi", "crown_segmentation", "overwrite", "num_workers"):
-        assert type(seen[field]) is int, field
-
-
 # ---------------------------------------------------------------------------
 # skip_segmented
 # ---------------------------------------------------------------------------
@@ -285,8 +240,6 @@ def test_an_stl_always_goes_to_the_engine(tmp_path, stub_engine, model_file):
 
 @pytest.mark.parametrize("requested", [None, "", "cpu", "CPU", " cpu "])
 def test_a_cpu_request_resolves_to_cpu(requested):
-    """shapeaxi accepts exactly "cpu" or "cuda:0"; anything else is a string it
-    hands to torch unread."""
     assert pipeline.resolve_device(requested) == "cpu"
 
 
@@ -313,14 +266,52 @@ def test_cuda_falls_back_to_cpu_with_a_warning_when_no_card_is_visible(monkeypat
     assert "CUDA is unavailable" in caplog.text
 
 
+@pytest.mark.parametrize("requested", ["mps", "MPS", " mps "])
+def test_an_mps_request_is_honoured_on_a_mac_with_metal(monkeypatch, requested):
+    """It used to resolve to the CPU, because shapeaxi accepted nothing else:
+    the Apple GPU was never reached from this tool. The engine has no such
+    limit, so the request now means what it says."""
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    monkeypatch.setattr("torch.backends.mps.is_available", lambda: True)
+
+    assert pipeline.resolve_device(requested) == "mps"
+
+
+def test_mps_falls_back_to_cpu_with_a_warning_when_metal_is_unavailable(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    monkeypatch.setattr("torch.backends.mps.is_available", lambda: False)
+
+    with caplog.at_level(logging.WARNING):
+        assert pipeline.resolve_device("mps") == "cpu"
+
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_never_used_off_a_mac(monkeypatch, caplog):
+    """A Linux build of torch answers `torch.backends.mps.is_available()` with
+    False anyway; the platform is checked as well so the answer does not depend
+    on a build."""
+    import logging
+
+    monkeypatch.setattr(pipeline.sys, "platform", "linux")
+    monkeypatch.setattr("torch.backends.mps.is_available", lambda: True)
+
+    with caplog.at_level(logging.WARNING):
+        assert pipeline.resolve_device("mps") == "cpu"
+
+    assert "MPS is unavailable" in caplog.text
+
+
 def test_the_resolved_device_is_what_reaches_the_engine_and_the_report(
     tmp_path, monkeypatch, model_file
 ):
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cuda:0")
     calls = []
     monkeypatch.setattr(
-        pipeline, "_run_shapeaxi",
+        pipeline, "_run_engine",
         lambda **kwargs: calls.append(kwargs["device"]) or write_surface(
             pipeline._predicted_path(
                 kwargs["output_dir"], "crownseg_input", kwargs["suffix"],
@@ -360,29 +351,6 @@ def test_a_run_that_segmented_nothing_records_no_device(tmp_path, stub_engine, m
 # num_workers
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("given, expected", [(0, 1), (-3, 1), (1, 1), (2, 2), (16, 16)])
-def test_num_workers_is_forced_to_at_least_one(tmp_path, monkeypatch, given, expected):
-    """shapeaxi builds its loader with `persistent_workers=True`, which PyTorch
-    rejects at 0 -- so a caller asking for no workers gets one rather than a
-    crash inside the DataLoader."""
-    seen = {}
-
-    class FakeModule:
-        @staticmethod
-        def main(args):
-            seen.update(vars(args))
-
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: FakeModule)
-
-    pipeline._run_shapeaxi(
-        csv_path="x.csv", output_dir=str(tmp_path), model_path="m.pth",
-        input_root=str(tmp_path), array_name="Universal_ID", suffix="Seg",
-        device="cpu", fdi=False, num_workers=given,
-    )
-
-    assert seen["num_workers"] == expected
-
-
 def test_num_workers_travels_from_run_to_the_engine(tmp_path, stub_engine, model_file):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
@@ -421,7 +389,7 @@ def test_a_directory_with_no_checkpoint_in_it_is_refused(tmp_path, stub_engine):
 
     So the refusal moved rather than disappearing -- what is refused is a folder
     with no crown checkpoint in it, and the message says what it looked for. An
-    empty folder still must not reach shapeaxi.
+    empty folder still must not reach the engine.
     """
     write_surface(tmp_path / "cohort" / "arch.vtk")
     (tmp_path / "models").mkdir()

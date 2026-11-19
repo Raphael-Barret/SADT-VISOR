@@ -1,4 +1,4 @@
-"""Crown segmentation on intraoral surface scans, via shapeaxi.
+"""Crown segmentation on intraoral surface scans.
 
 Labels every tooth of a mesh with its Universal number, as a point-data array
 on a copy of the surface. That array is the precondition for ALI's IOS landmark
@@ -7,12 +7,11 @@ this is its own tool rather than a helper inside any of them -- and, since the
 split, why the server sequences CrownSeg before ALI instead of ALI importing
 this module.
 
-Nothing here is ported. The Slicer modules ran the `dentalmodelseg` executable
-out of Slicer's own bin directory, and that executable is only the
-console-script entry point of the `shapeaxi` PyPI package
-(`dentalmodelseg = shapeaxi.dental_model_seg:cml`). There is no Slicer binary
-to shell out to, so `shapeaxi.dental_model_seg.main` is called directly with
-the namespace its own `cml()` would have built.
+The method is shapeaxi's `dentalmodelseg` (the Slicer modules ran its
+executable), but shapeaxi itself is no longer called: it imports pytorch3d,
+which has no Windows wheel and no Metal kernel. `engine.py` carries the same
+pipeline on torch, monai, VTK and Embree, and this module only prepares what it
+needs (the mesh list, the output paths, the device) and reports what came out.
 
 What the move out of the server changed: scratch space lives under the caller's
 `output_dir`, `segment_crowns()` returns the run report rather than a
@@ -29,9 +28,9 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sys
 import threading
 import time
-from argparse import Namespace
 
 from . import progress
 from .errors import ToolInputError, ToolUnavailableError
@@ -49,7 +48,7 @@ logger = logging.getLogger(__name__)
 # `parents[2]` is <tool>/src/<package>/thisfile.py -> <tool>.
 TOOL_NAME = Path(__file__).resolve().parents[2].name
 
-# Extensions shapeaxi's reader handles and this tool therefore discovers.
+# Extensions the engine's reader handles and this tool therefore discovers.
 SURFACE_EXTENSIONS = (".vtk", ".stl")
 
 # Point-data array names that already carry per-tooth labels. A mesh holding
@@ -88,7 +87,7 @@ def array_name_for(numbering: str) -> str:
 
 WORK_DIRNAME = ".crownseg_work"
 
-# How often, in seconds, the output tree is looked at while shapeaxi runs. One
+# How often, in seconds, the output tree is looked at while the engine runs. One
 # mesh takes about 52 s on the card, so two seconds is fine-grained enough to
 # move the bar promptly and coarse enough to cost nothing.
 WATCH_INTERVAL = 2.0
@@ -102,42 +101,66 @@ PUBLISHED_CHECKPOINT = "07-21-22_val-loss0.169.pth"
 CROWN_CHECKPOINT_MARKER = "val-loss"
 
 _INSTALL_HINT = (
-    "CrownSeg's engine is an optional extra. Install it with "
+    "CrownSeg's engine is an optional extra (monai and embreex). Install it with "
     "`uv sync --extra segmentation` in tools/Crown_Seg. A deployment image "
     "builds it with `--all-extras`; if this appears there, the image was built "
     "without them."
 )
 
 
-def _import_dental_model_seg():
-    """Import shapeaxi's segmentation module, lazily.
+def _import_engine():
+    """Import the segmentation engine, lazily.
 
     Deferred so that importing this package -- which `scripts/describe.py` does
     on every CI run to publish the schema -- costs nothing. It also means a
     venv without the extra still loads and reports the schema; only an actual
     segmentation fails, naming what is missing.
+
+    Two things can be missing and they are probed together: monai, which the
+    engine imports at load time, and embreex, which the renderer would only
+    import on its first ray. Left to the first ray, a missing embreex would
+    pass this probe, report `engine_available` and then fail the run.
     """
     try:
-        from shapeaxi import dental_model_seg
+        from . import engine, render_native
+
+        render_native.require_embree()
     except ImportError as exc:
         raise ToolUnavailableError(
-            "{} (missing: {})".format(_INSTALL_HINT, exc.name or "shapeaxi")
+            "{} (missing: {})".format(_INSTALL_HINT, exc.name or "monai")
         ) from exc
+    except render_native.ToolUnavailableError as exc:
+        raise ToolUnavailableError("{} ({})".format(_INSTALL_HINT, str(exc).rsplit("(", 1)[-1].rstrip(")"))) from exc
 
-    return dental_model_seg
+    return engine
 
 
 def resolve_device(requested: str = None) -> str:
-    """The device string shapeaxi accepts: exactly "cpu" or "cuda:0"."""
+    """The device the network runs on: "cpu", "cuda:0" or, on a Mac, "mps".
+
+    CUDA is always the first card: a tool is one process with whatever the
+    server made visible to it. A device that cannot be had falls back to the CPU
+    with a warning rather than failing the run. MPS is honoured on macOS only;
+    shapeaxi accepted nothing but "cpu" and "cuda:0", so a request for "mps"
+    used to run on the CPU without a word, which the engine no longer does.
+    """
     import torch
 
     wanted = (requested or "cpu").strip().lower()
-    if wanted.startswith("cuda") and torch.cuda.is_available():
-        return "cuda:0"
     if wanted.startswith("cuda"):
+        if torch.cuda.is_available():
+            return "cuda:0"
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
         progress.log(
             "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
+        )
+    elif wanted == "mps":
+        if sys.platform == "darwin" and torch.backends.mps.is_available():
+            return "mps"
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        progress.log(
+            "the Apple GPU was requested but is not available; segmenting on the CPU",
             "warning",
         )
     return "cpu"
@@ -297,94 +320,41 @@ def _input_root(input_path: str, meshes: list) -> str:
 # Segmentation
 # ---------------------------------------------------------------------------
 
-_LOADER_MARK = "_sadt_crownseg_loader"
+def _run_engine(csv_path: str, output_dir: str, model_path: str, input_root: str,
+                array_name: str, suffix: str, device: str, fdi: bool,
+                num_workers: int = 2) -> None:
+    """Segment every mesh of the csv, writing each where `_predicted_path` says.
 
+    The checkpoint is loaded once for the batch, hash-checked and read with
+    `weights_only=True` (see `engine.load_network`), and the 42 cameras are
+    built once. `num_workers` is accepted and unused: it sized shapeaxi's
+    DataLoader, the engine reads each mesh in this process, and the argument is
+    published, so a request that sends it must keep working.
 
-def _install_checkpoint_loader():
-    """Wrap `torch.load` once per process: CPU `map_location` and
-    `weights_only=True` unless the caller says otherwise. Idempotent (a second
-    call finds the mark and does nothing, so wrappers never stack); the original
-    stays reachable as `torch.load.__wrapped__`. macOS-only, called from the
-    darwin block of `_run_shapeaxi`."""
-    import functools
-
-    import torch
-
-    current = torch.load
-    if getattr(current, _LOADER_MARK, False):
-        return current
-
-    @functools.wraps(current)
-    def _load_safely(*args, **kwargs):
-        kwargs.setdefault("map_location", "cpu")
-        kwargs.setdefault("weights_only", True)
-        return current(*args, **kwargs)
-
-    setattr(_load_safely, _LOADER_MARK, True)
-    torch.load = _load_safely
-    return _load_safely
-
-
-def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: str,
-                  array_name: str, suffix: str, device: str, fdi: bool,
-                  num_workers: int) -> None:
-    """Call shapeaxi's own `main()` with the namespace its `cml()` would build.
-
-    stdout is swallowed on purpose. shapeaxi prints "Saving results to <path>"
-    for every mesh, and that path carries the patient's own file name, which
-    must not reach a log. The exception it raises on a real failure is
-    untouched.
+    stdout is swallowed on purpose. A library under the engine may print the
+    path of the scan it reads, and that path carries the patient's own file
+    name, which must not reach a log. The exception it raises on a real failure
+    is untouched.
     """
-    dental_model_seg = _import_dental_model_seg()
+    engine = _import_engine()
 
-    from . import embree_raster
-
-    if embree_raster.wanted(device):
-        # macOS / MPS: pytorch3d has no Metal rasterizer. DentalModelSeg builds
-        # its renderer from the module-level `MeshRasterizer` name, so pointing
-        # that name at the Embree subclass is enough; `render` and the shader
-        # are shapeaxi's, unchanged. Only this process is affected.
-        from shapeaxi import saxi_nets_lightning
-
-        saxi_nets_lightning.MeshRasterizer = embree_raster.rasterizer_class()
-        logger.info("Rasterizing with Embree instead of pytorch3d (device=%s)", device)
-
-        # shapeaxi 2.0.2 reads the checkpoint with `torch.load(path)` and no
-        # `map_location` (saxi_nets_lightning.py, `dental_model_seg_args`). The
-        # published `07-21-22_val-loss0.169.pth` was saved from a CUDA device,
-        # so on a machine with no CUDA (every Mac) it fails with "Attempting to
-        # deserialize object on a CUDA device but torch.cuda.is_available() is
-        # False". Inside this macOS-only block, so Linux is untouched.
-        #
-        # The wrapper also pins `weights_only=True` by default (never relaxed
-        # here): torch >= 2.6 already defaults to it, but the pin does not
-        # depend on the torch version, and passing it explicitly keeps
-        # TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 from turning the call back into a
-        # full pickle load. A trapped checkpoint is refused, not executed.
-        _install_checkpoint_loader()
-
-    args = Namespace(
-        surf=None,
-        csv=csv_path,
-        model=model_path,
-        suffix=suffix,
-        out=output_dir,
-        # Must be >= 1: shapeaxi builds its loader with persistent_workers=True,
-        # which PyTorch rejects at 0.
-        num_workers=max(1, int(num_workers)),
-        crown_segmentation=0,
-        array_name=array_name,
-        fdi=1 if fdi else 0,
-        overwrite=0,
-        device=device,
-        vtk_folder=input_root,
-    )
+    with open(csv_path, encoding="utf-8", newline="") as handle:
+        meshes = [line.strip() for line in handle.read().splitlines()[1:] if line.strip()]
+    csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
 
     with contextlib.redirect_stdout(io.StringIO()):
-        dental_model_seg.main(args)
+        network = engine.load_network(model_path)
+        network.to(device).eval()
+        rig = engine.camera_rig()
+        for mesh in meshes:
+            engine.segment_mesh(
+                network, rig, mesh,
+                _predicted_path(output_dir, csv_stem, suffix, mesh, input_root),
+                array_name, fdi=fdi, device=device,
+            )
 
 
-# The longest cause quoted back out of a shapeaxi failure. The server cuts a
+# The longest cause quoted back out of an engine failure. The server cuts a
 # failure's reason at about 300 characters, so the cause has to fit well inside
 # that together with the count that precedes it.
 MAX_CAUSE = 200
@@ -393,8 +363,8 @@ MAX_CAUSE = 200
 def _last_meaningful_line(message) -> str:
     """The line of an exception message that actually says what went wrong.
 
-    shapeaxi runs its meshes through a PyTorch DataLoader, and an error raised
-    in a loader worker comes back re-wrapped: "Caught ValueError in DataLoader
+    shapeaxi ran its meshes through a PyTorch DataLoader, and an error raised
+    in a loader worker came back re-wrapped: "Caught ValueError in DataLoader
     worker process 0.", then "Original Traceback (most recent call last):",
     then the whole worker traceback, and only on the LAST line the real
     "ValueError: <message>". The server keeps the first few hundred characters
@@ -427,9 +397,9 @@ def _describe_failure(exc) -> str:
 
 @contextlib.contextmanager
 def _counting_outputs(expected, what, interval=None):
-    """Report "mesh k of n" while shapeaxi runs, from the outputs that exist.
+    """Report "mesh k of n" while the engine runs, from the outputs that exist.
 
-    shapeaxi takes the whole batch in one call and says nothing on the way, but
+    The engine takes the whole batch in one call and says nothing on the way, but
     it writes each mesh's segmented copy as soon as that mesh is done, to a
     path known in advance. So the number of those files that exist IS the
     number of meshes finished -- a count, not an estimate -- and a thread that
@@ -472,9 +442,10 @@ def _counting_outputs(expected, what, interval=None):
 
 def _predicted_path(output_dir: str, csv_stem: str, suffix: str, mesh: str,
                     input_root: str) -> str:
-    """Where shapeaxi's csv branch writes the segmented copy of `mesh`.
+    """Where the engine writes the segmented copy of `mesh`.
 
-    Mirrors `save_data_vtk_from_csv`: the input path minus its extension, plus
+    The layout is shapeaxi's csv branch (`save_data_vtk_from_csv`), kept so the
+    output tree is the one every consumer already reads: the input path minus its extension, plus
     `_<suffix>.vtk`, with `vtk_folder` stripped off the front, filed under
     `<out>/<csv stem>_<suffix>/`. Recomputed rather than parsed back out of
     shapeaxi's stdout, which is where the file names this tool must not log
@@ -538,7 +509,7 @@ def segment_crowns(
         )
     finally:
         # `finally`, not "after the run and again in an except": the scratch
-        # directory used to survive every error path that was not shapeaxi's
+        # directory used to survive every error path that was not the engine's
         # own, and it holds a csv listing the patient's file paths.
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -555,7 +526,7 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
         (already_segmented if skip_segmented and is_segmented(mesh) else to_segment).append(mesh)
 
     # Probed HERE, before the split decides whether the engine is ever reached.
-    # The engine is imported inside `_run_shapeaxi`, which only runs when
+    # The engine is imported inside `_run_engine`, which only runs when
     # something needs segmenting -- so a batch that happens to be entirely
     # pre-labelled returned a clean report on a deployment where the
     # `segmentation` extra is not installed at all, and the same deployment
@@ -570,7 +541,7 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
     # registry must refuse to serve a tool whose declared extras are absent,
     # the same way it refuses a tool whose schema no longer matches its source.
     try:
-        _import_dental_model_seg()
+        _import_engine()
         engine_available, engine_error = True, None
     except Exception as exc:  # ToolUnavailableError, or anything its import raises
         engine_available, engine_error = False, f"{type(exc).__name__}: {exc}"
@@ -634,7 +605,7 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
             for mesh in to_segment
         ]
-        # Said BEFORE the call, because a failure inside shapeaxi arrives as one
+        # Said BEFORE the call, because a failure inside the engine arrives as one
         # opaque exception for the whole batch: this line is what tells the
         # operator which checkpoint, how many meshes and which device were
         # being attempted when it came. The checkpoint's name is the model's,
@@ -643,12 +614,12 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             "loading checkpoint %s and segmenting %d mesh(es) on %s",
             os.path.basename(model_path), total, device,
         )
-        # The model load inside shapeaxi is not visible from here, so the first
+        # The model load inside the engine is not visible from here, so the first
         # mesh is announced at the start of the bar and the load is part of it.
         progress.report(1, total, "mesh")
         try:
             with _counting_outputs(expected, "mesh"):
-                _run_shapeaxi(
+                _run_engine(
                     csv_path=csv_path,
                     output_dir=output_dir,
                     model_path=model_path,
@@ -664,15 +635,15 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             # server answers 503 or 422; rewrapping would turn both into a 500.
             raise
         except Exception as exc:
-            # shapeaxi takes the batch in one call, so its failure carries no
+            # the engine takes the batch in one call, so its failure carries no
             # position. The outputs on disk do: they say how far it got.
             written = sum(1 for path in expected if os.path.isfile(path))
             cause = _describe_failure(exc)
             logger.error(
-                "shapeaxi failed after %d of %d meshes were written (%s)",
+                "the engine failed after %d of %d meshes were written (%s)",
                 written, total, cause,
             )
-            # RuntimeError whatever shapeaxi raised: a ValueError out of its
+            # RuntimeError whatever the engine raised: a ValueError out of its
             # loader is a fault of the bundled engine or of this server, not
             # an argument the caller sent, and must not be answered as a 422.
             # The cause comes first so the server's cut keeps it.
@@ -689,9 +660,9 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                                      "produced": [predicted]}
                 produced.append(predicted)
             else:
-                # One mesh shapeaxi could not write must not cost the batch.
+                # One mesh the engine could not write must not cost the batch.
                 logger.warning(
-                    "mesh %d of %d: segmentation failed (shapeaxi returned "
+                    "mesh %d of %d: segmentation failed (the engine returned "
                     "without error but wrote no output for it)", index, total,
                 )
                 progress.log(
@@ -707,13 +678,13 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
 
     failed = sum(1 for r in records.values() if r["status"] == "failed")
     if not produced:
-        # Only reachable when every mesh went to shapeaxi and it returned
+        # Only reachable when every mesh went to the engine and it returned
         # cleanly having written none of them -- an exception would have been
         # raised above. Saying so explicitly is the point: "no output" with no
         # error is a different fault (a wrong output layout, a silent skip)
         # from a crash, and the operator has nothing else to tell them apart.
         raise RuntimeError(
-            f"0 of {len(meshes)} meshes segmented; shapeaxi returned without "
+            f"0 of {len(meshes)} meshes segmented; the engine returned without "
             f"error but wrote none of the {len(to_segment)} expected outputs"
         )
 
@@ -769,7 +740,7 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
 def _write_as_vtk(source: str, destination: str) -> None:
     """Copy a mesh to `destination` as .vtk polydata.
 
-    A pre-segmented input can be an .stl, and shapeaxi's outputs are always
+    A pre-segmented input can be an .stl, and the outputs are always
     .vtk; normalizing here means the caller gets one format whichever branch a
     mesh took, instead of an .stl that every downstream reader then has to
     special-case. (The Slicer module copied it verbatim, and its landmark CLI

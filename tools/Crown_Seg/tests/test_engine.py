@@ -441,6 +441,8 @@ def test_the_written_file_is_byte_identical_from_one_run_to_the_next(sphere, tmp
 
     first, second = (open(path, "rb").read() for path in outputs)
     assert first == second
+    # Slicer reads a .vtk without this line as LPS and warns on every load.
+    assert first.splitlines()[1] == b"SPACE=LPS"
     reader = vtk.vtkPolyDataReader()
     reader.SetFileName(outputs[0])
     reader.Update()

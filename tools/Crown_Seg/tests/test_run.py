@@ -1,11 +1,10 @@
 """End-to-end tests for CrownSeg.
 
-shapeaxi's segmentation is stubbed, so everything around it -- input discovery,
+The segmentation engine is stubbed, so everything around it -- input discovery,
 the already-segmented bypass, the output tree, the run report -- runs for real.
-The network itself cannot run in CI: it lives behind the `segmentation` extra,
-because shapeaxi requires pytorch3d and pytorch3d is compiled from source. That
-is the whole reason it is imported lazily, and `test_real_model_*` is what
-covers it when the extra is installed.
+The network itself needs the `segmentation` extra (monai and embreex), which a
+CI venv deliberately does not install. That is the whole reason it is imported
+lazily, and `test_real_model_*` is what covers it when the extra is installed.
 """
 
 import json
@@ -50,10 +49,10 @@ def write_surface(path, labelled=False, array_name="Universal_ID"):
 
 
 @pytest.fixture
-def stub_shapeaxi(monkeypatch, tmp_path):
+def stub_engine_run(monkeypatch, tmp_path):
     """Write a labelled mesh wherever shapeaxi would have written one.
 
-    The import probe is stubbed too. Replacing only `_run_shapeaxi` left a
+    The import probe is stubbed too. Replacing only `_run_engine` left a
     half-stubbed world: on a machine without the `segmentation` extra the probe
     still failed, so an already-segmented mesh came back `engine_unavailable`
     rather than `already_segmented` and the pass-through test failed for a
@@ -62,7 +61,7 @@ def stub_shapeaxi(monkeypatch, tmp_path):
     install extras. A fixture that stands in for a working engine has to stand
     in for all of it.
     """
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     calls = []
 
     def fake_run(csv_path, output_dir, model_path, input_root, array_name, suffix,
@@ -87,7 +86,7 @@ def stub_shapeaxi(monkeypatch, tmp_path):
             )
             write_surface(destination, labelled=True, array_name=array_name)
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", fake_run)
+    monkeypatch.setattr(pipeline, "_run_engine", fake_run)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
     # The model is a required argument now, so the tests need a file that
     # exists -- segment_crowns refuses a path that does not.
@@ -155,7 +154,7 @@ def test_an_empty_folder_is_a_422(tmp_path):
 # Segmentation
 # ---------------------------------------------------------------------------
 
-def test_a_raw_mesh_is_segmented_and_reported(tmp_path, stub_shapeaxi):
+def test_a_raw_mesh_is_segmented_and_reported(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     report = pipeline.segment_crowns(
@@ -172,7 +171,7 @@ def test_a_raw_mesh_is_segmented_and_reported(tmp_path, stub_shapeaxi):
     assert pipeline.is_segmented(report["segmented_meshes"][0])
 
 
-def test_an_already_segmented_mesh_is_passed_through(tmp_path, stub_shapeaxi):
+def test_an_already_segmented_mesh_is_passed_through(tmp_path, stub_engine_run):
     """Minutes of GPU time per mesh, for an array that is already there."""
     write_surface(tmp_path / "cohort" / "arch.vtk", labelled=True)
 
@@ -182,12 +181,12 @@ def test_an_already_segmented_mesh_is_passed_through(tmp_path, stub_shapeaxi):
         output_dir=str(tmp_path / "out")
     )
 
-    assert stub_shapeaxi == []  # the network was never invoked
+    assert stub_engine_run == []  # the network was never invoked
     assert report["summary"]["already_segmented"] == 1
     assert pipeline.is_segmented(report["segmented_meshes"][0])
 
 
-def test_skip_segmented_false_re_runs_the_network(tmp_path, stub_shapeaxi):
+def test_skip_segmented_false_re_runs_the_network(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk", labelled=True)
 
     report = pipeline.segment_crowns(
@@ -196,11 +195,11 @@ def test_skip_segmented_false_re_runs_the_network(tmp_path, stub_shapeaxi):
         output_dir=str(tmp_path / "out"),
         skip_segmented=False,
     )
-    assert len(stub_shapeaxi) == 1
+    assert len(stub_engine_run) == 1
     assert report["summary"]["segmented"] == 1
 
 
-def test_a_batch_keeps_its_tree(tmp_path, stub_shapeaxi):
+def test_a_batch_keeps_its_tree(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "siteA" / "arch.vtk")
     write_surface(tmp_path / "cohort" / "siteB" / "arch.vtk")
 
@@ -219,7 +218,7 @@ def test_a_batch_keeps_its_tree(tmp_path, stub_shapeaxi):
     ]
 
 
-def test_the_input_csv_is_written_under_the_output_dir_and_removed(tmp_path, stub_shapeaxi):
+def test_the_input_csv_is_written_under_the_output_dir_and_removed(tmp_path, stub_engine_run):
     """The Slicer module wrote it into the extension's own source folder,
     which breaks a read-only install and leaves behind a file pointing at the
     patient's data."""
@@ -230,12 +229,12 @@ def test_the_input_csv_is_written_under_the_output_dir_and_removed(tmp_path, stu
         model_path=str(tmp_path / "model.pth"),
         output_dir=str(tmp_path / "out")
     )
-    csv_path = stub_shapeaxi[0]["csv"]
+    csv_path = stub_engine_run[0]["csv"]
     assert csv_path.startswith(str(tmp_path / "out"))
     assert not os.path.exists(csv_path), "the work dir does not survive the run"
 
 
-def test_the_run_report_lands_beside_the_results(tmp_path, stub_shapeaxi):
+def test_the_run_report_lands_beside_the_results(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     returned = pipeline.segment_crowns(
@@ -251,7 +250,7 @@ def test_the_run_report_lands_beside_the_results(tmp_path, stub_shapeaxi):
     assert written == returned
 
 
-def test_fdi_numbering_is_passed_through(tmp_path, stub_shapeaxi):
+def test_fdi_numbering_is_passed_through(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     report = pipeline.segment_crowns(
@@ -259,11 +258,11 @@ def test_fdi_numbering_is_passed_through(tmp_path, stub_shapeaxi):
         model_path=str(tmp_path / "model.pth"),
         output_dir=str(tmp_path / "out"), fdi=True
     )
-    assert stub_shapeaxi[0]["fdi"] is True
+    assert stub_engine_run[0]["fdi"] is True
     assert report["numbering"] == "FDI"
 
 
-def test_a_missing_checkpoint_is_reported_as_an_input_error(tmp_path, stub_shapeaxi):
+def test_a_missing_checkpoint_is_reported_as_an_input_error(tmp_path, stub_engine_run):
     """The model is an argument now, not a name looked up in a data store."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
@@ -279,7 +278,7 @@ def test_a_missing_checkpoint_is_reported_as_an_input_error(tmp_path, stub_shape
 # run()
 # ---------------------------------------------------------------------------
 
-def test_run_returns_the_output_directory_it_was_given(tmp_path, stub_shapeaxi):
+def test_run_returns_the_output_directory_it_was_given(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     output = run(
@@ -292,7 +291,7 @@ def test_run_returns_the_output_directory_it_was_given(tmp_path, stub_shapeaxi):
     assert (output / "run_report.json").is_file()
 
 
-def test_run_writes_nothing_outside_the_output_directory(tmp_path, stub_shapeaxi):
+def test_run_writes_nothing_outside_the_output_directory(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
     before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
 
@@ -306,7 +305,7 @@ def test_run_writes_nothing_outside_the_output_directory(tmp_path, stub_shapeaxi
     assert after == before
 
 
-def test_the_work_dir_does_not_survive_the_run(tmp_path, stub_shapeaxi):
+def test_the_work_dir_does_not_survive_the_run(tmp_path, stub_engine_run):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
     output = run(meshes=tmp_path / "cohort", model=tmp_path / "model.pth",
@@ -315,7 +314,7 @@ def test_the_work_dir_does_not_survive_the_run(tmp_path, stub_shapeaxi):
     assert not (output / pipeline.WORK_DIRNAME).exists()
 
 
-def test_the_report_lists_what_a_caller_sequencing_ali_needs(tmp_path, stub_shapeaxi):
+def test_the_report_lists_what_a_caller_sequencing_ali_needs(tmp_path, stub_engine_run):
     """The server runs CrownSeg then ALI, so the report has to name the meshes
     that now carry labels -- ALI no longer imports this tool to find out."""
     write_surface(tmp_path / "cohort" / "raw.vtk")
@@ -345,19 +344,19 @@ def test_a_venv_without_the_extra_says_how_to_install_it(tmp_path, monkeypatch):
 
     This is the state CI is in and the state a fresh clone is in, so the
     message is the only thing standing between a maintainer and a bare
-    ModuleNotFoundError from inside shapeaxi.
+    ModuleNotFoundError from inside the renderer.
     """
-    if _shapeaxi_installed():
+    if _engine_installed():
         pytest.skip("the segmentation extra is installed in this venv")
 
     with pytest.raises(ToolUnavailableError, match="uv sync --extra segmentation"):
-        pipeline._import_dental_model_seg()
+        pipeline._import_engine()
 
 
-def _shapeaxi_installed() -> bool:
+def _engine_installed() -> bool:
     import importlib.util
 
-    return importlib.util.find_spec("shapeaxi") is not None
+    return all(importlib.util.find_spec(name) is not None for name in ("monai", "embreex"))
 
 
 @pytest.mark.gpu
@@ -367,7 +366,7 @@ def _shapeaxi_installed() -> bool:
     reason="set SADT_CROWNSEG_MODEL and SADT_CROWNSEG_MESH (see tests/data/README.md)",
 )
 def test_real_model_labels_a_real_mesh(tmp_path):
-    """The real checkpoint through the real shapeaxi, on a real arch."""
+    """The real checkpoint through the real engine, on a real arch."""
     output = run(
         meshes=Path(REAL_MESH),
         model=Path(REAL_MODEL),
@@ -388,7 +387,7 @@ def test_real_model_labels_a_real_mesh(tmp_path):
 # The checkpoint, when nobody names one
 # ---------------------------------------------------------------------------
 
-def test_the_installed_checkpoint_is_used_when_none_is_named(tmp_path, stub_shapeaxi):
+def test_the_installed_checkpoint_is_used_when_none_is_named(tmp_path, stub_engine_run):
     """A panel with no model field sends none, and the tool finds its own.
 
     Left required, this was not merely a field too many: AREG IOS and IOSCBCT
@@ -406,10 +405,10 @@ def test_the_installed_checkpoint_is_used_when_none_is_named(tmp_path, stub_shap
 
     report = json.loads((output / "run_report.json").read_text())
     assert report["checkpoint"] == pipeline.PUBLISHED_CHECKPOINT
-    assert stub_shapeaxi[0]["model"].endswith(pipeline.PUBLISHED_CHECKPOINT)
+    assert stub_engine_run[0]["model"].endswith(pipeline.PUBLISHED_CHECKPOINT)
 
 
-def test_a_named_checkpoint_still_wins_over_the_installed_one(tmp_path, stub_shapeaxi):
+def test_a_named_checkpoint_still_wins_over_the_installed_one(tmp_path, stub_engine_run):
     """Naming one is pinning which weights ran, and is obeyed."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
     models = tmp_path / "data" / "Crown_Seg" / "models"
@@ -419,10 +418,10 @@ def test_a_named_checkpoint_still_wins_over_the_installed_one(tmp_path, stub_sha
     run(meshes=tmp_path / "cohort", model=tmp_path / "model.pth",
         output_dir=tmp_path / "out", data_root=tmp_path / "data")
 
-    assert stub_shapeaxi[0]["model"] == str(tmp_path / "model.pth")
+    assert stub_engine_run[0]["model"] == str(tmp_path / "model.pth")
 
 
-def test_no_model_and_no_data_root_says_which_of_the_two_is_missing(tmp_path, stub_shapeaxi):
+def test_no_model_and_no_data_root_says_which_of_the_two_is_missing(tmp_path, stub_engine_run):
     """A checkout running this by hand, rather than a server publishing a data
     root."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
@@ -439,7 +438,7 @@ def test_no_model_and_no_data_root_says_which_of_the_two_is_missing(tmp_path, st
     ("Universal", pipeline.DEFAULT_ARRAY_NAME),
     ("FDI", pipeline.FDI_ARRAY_NAME),
 ])
-def test_the_array_is_named_after_the_numbering(tmp_path, stub_shapeaxi, numbering, expected):
+def test_the_array_is_named_after_the_numbering(tmp_path, stub_engine_run, numbering, expected):
     """shapeaxi's `ConvertFDI` rewrites the values in place under the SAME array
     name, so asking for FDI produced an array called `Universal_ID` holding FDI
     numbers. The two systems overlap almost completely -- FDI 18 is the upper
@@ -450,7 +449,7 @@ def test_the_array_is_named_after_the_numbering(tmp_path, stub_shapeaxi, numberi
     output = run(meshes=tmp_path / "cohort", model=tmp_path / "model.pth",
                  output_dir=tmp_path / "out", numbering=numbering)
 
-    assert stub_shapeaxi[0]["array_name"] == expected
+    assert stub_engine_run[0]["array_name"] == expected
     assert json.loads((output / "run_report.json").read_text())["array_name"] == expected
 
 
@@ -467,7 +466,7 @@ def test_an_fdi_mesh_carries_no_name_the_consumers_know(tmp_path):
     assert pipeline.FDI_ARRAY_NAME in pipeline.LABEL_ARRAY_NAMES
 
 
-def test_a_named_array_still_wins(tmp_path, stub_shapeaxi):
+def test_a_named_array_still_wins(tmp_path, stub_engine_run):
     """A caller that names one is choosing, and is obeyed -- which is what
     keeps a request written against the old default working unchanged."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
@@ -475,7 +474,7 @@ def test_a_named_array_still_wins(tmp_path, stub_shapeaxi):
     run(meshes=tmp_path / "cohort", model=tmp_path / "model.pth",
         output_dir=tmp_path / "out", numbering="FDI", array_name="Universal_ID")
 
-    assert stub_shapeaxi[0]["array_name"] == "Universal_ID"
+    assert stub_engine_run[0]["array_name"] == "Universal_ID"
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +495,7 @@ def _engine_writing_one_mesh_at_a_time(monkeypatch, events_file, write_only=None
     depend on how fast this machine is."""
     import time
 
-    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "_import_engine", lambda: None)
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
     monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 0.01)
 
@@ -519,7 +518,7 @@ def _engine_writing_one_mesh_at_a_time(monkeypatch, events_file, write_only=None
                     break
                 time.sleep(0.01)
 
-    monkeypatch.setattr(pipeline, "_run_shapeaxi", fake_run)
+    monkeypatch.setattr(pipeline, "_run_engine", fake_run)
 
 
 def test_progress_counts_the_meshes_shapeaxi_has_finished(tmp_path, monkeypatch):
